@@ -19,7 +19,7 @@ final class FrameEncoder {
 
     init() {
         VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transfer)
-        VTPixelRotationSessionCreate(allocator: nil, pixelRotationSessionOut: &rotation)
+        VTPixelRotationSessionCreate(nil, &rotation)
     }
 
     deinit {
@@ -53,7 +53,7 @@ final class FrameEncoder {
             rotated = Self.reuse(rotated, width: sideways ? h : w, height: sideways ? w : h)
             guard let rotated,
                   VTSessionSetProperty(rotation, key: kVTPixelRotationPropertyKey_Rotation, value: angle) == noErr,
-                  VTPixelRotationSessionRotateImage(rotation, from: scaled, to: rotated) == noErr else {
+                  VTPixelRotationSessionRotateImage(rotation, scaled, rotated) == noErr else {
                 return nil
             }
             output = rotated
