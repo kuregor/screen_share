@@ -1,0 +1,57 @@
+name: ScreenShare
+options:
+  bundleIdPrefix: com.prekoli
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  ScreenShare:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Shared
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Экран на ТВ
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSLocalNetworkUsageDescription: Нужно, чтобы телевизор видел экран телефона в сети Wi-Fi.
+        NSBonjourServices:
+          - _screenshare._tcp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.prekoli.screenshare
+    dependencies:
+      - target: Broadcast
+    scheme: {}
+  Broadcast:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Broadcast
+      - Shared
+    info:
+      path: Broadcast/Info.plist
+      properties:
+        CFBundleDisplayName: Экран на ТВ
+        NSLocalNetworkUsageDescription: Нужно, чтобы телевизор видел экран телефона в сети Wi-Fi.
+        NSBonjourServices:
+          - _screenshare._tcp
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
+          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.prekoli.screenshare.broadcast
+    dependencies:
+      - sdk: ReplayKit.framework
+      - sdk: VideoToolbox.framework

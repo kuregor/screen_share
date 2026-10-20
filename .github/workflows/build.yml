@@ -1,0 +1,37 @@
+name: Сборка iOS
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить XcodeGen
+        run: brew install xcodegen
+
+      - name: Сгенерировать проект
+        run: xcodegen generate
+
+      # Собираем без подписи: Sideloadly подпишет приложение Apple ID при установке.
+      - name: Собрать
+        run: |
+          xcodebuild -project ScreenShare.xcodeproj -scheme ScreenShare \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Упаковать IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/ScreenShare.app Payload/
+          zip -qry ScreenShare.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenShare-ipa
+          path: ScreenShare.ipa

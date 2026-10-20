@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Экран на ТВ</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    color: #e8e8e8;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  /* Браузер телевизора может быть старым Chromium: без gap и inset, только flex и отступы. */
+  #screens { display: flex; height: 100%; padding: 1vh 1vw; }
+  .screen { position: relative; flex: 1 1 0; min-width: 0; }
+  .screen + .screen { margin-left: 1vw; }
+  .screen img { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .label {
+    position: absolute;
+    top: 2vh;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: .4em .9em;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, .6);
+    font-size: 2.2vh;
+    white-space: nowrap;
+    transition: opacity .4s;
+  }
+  #empty {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 0 10vw;
+    text-align: center;
+  }
+  #empty h1 { margin: 0 0 3vh; font-size: 5.5vh; font-weight: 600; }
+  #empty p { margin: .5em 0; font-size: 2.8vh; line-height: 1.4; color: #9a9a9a; }
+  #bar { position: fixed; right: 2vw; bottom: 3vh; transition: opacity .4s; }
+  #fullscreen {
+    padding: .7em 1.4em;
+    border: 0;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, .14);
+    color: #fff;
+    font: inherit;
+    font-size: 2.4vh;
+    cursor: pointer;
+  }
+  #fullscreen:focus { outline: 3px solid #4da3ff; outline-offset: 3px; }
+  body.idle { cursor: none; }
+  body.idle .label, body.idle #bar { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="screens"></div>
+<div id="empty">
+  <h1>Ждём телефон</h1>
+  <p>На iPhone открой «Экран на ТВ» и нажми «Начать вещание».</p>
+  <p>Телефон и телевизор должны быть в одной сети Wi-Fi.</p>
+</div>
+<div id="bar"><button id="fullscreen" type="button">Во весь экран</button></div>
+<script>
+// Только ES5: встроенный браузер старых телевизоров LG не знает let, стрелочные функции и async.
+(function () {
+  'use strict';
+
+  var POLL_MS = 2000;
+  var MAX_FAILS = 3;
+  var HIDE_UI_MS = 4000;
+
+  // Телефоны в порядке обнаружения: первый показывается слева.
+  var phones = [];
+  var screens = document.getElementById('screens');
+  var empty = document.getElementById('empty');
+
+  function find(host) {
+    for (var i = 0; i < phones.length; i++) {
+      if (phones[i].host === host) return phones[i];
+    }
+    return null;
+  }
+
+  function add(host) {
+    if (host && !find(host)) phones.push({ host: host, fails: 0, tile: null, img: null });
+  }
+
+  // Каждый телефон отвечает, жив ли он, и сообщает адреса соседей, найденных через Bonjour.
+  function poll(phone) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', 'http://' + phone.host + '/status?t=' + Date.now());
+    xhr.timeout = 1500;
+    xhr.onload = function () {
+      var status;
+      try {
+        status = JSON.parse(xhr.responseText);
+      } catch (e) {
+        fail(phone);
+        return;
+      }
+      phone.fails = 0;
+      show(phone);
+      (status.peers || []).forEach(add);
+    };
+    xhr.onerror = xhr.ontimeout = function () { fail(phone); };
+    xhr.send();
+  }
+
+  function fail(phone) {
+    phone.fails++;
+    if (phone.fails >= MAX_FAILS) hide(phone);
+  }
+
+  function connect(phone) {
+    phone.img.src = 'http://' + phone.host + '/stream?t=' + Date.now();
+  }
+
+  function show(phone) {
+    if (phone.tile) return;
+    var tile = document.createElement('div');
+    var img = document.createElement('img');
+    var label = document.createElement('div');
+    tile.className = 'screen';
+    label.className = 'label';
+    tile.appendChild(img);
+    tile.appendChild(label);
+    phone.tile = tile;
+    phone.img = img;
+
+    // Поток оборвался, а телефон ещё отвечает на /status: переподключаемся.
+    img.onerror = function () {
+      setTimeout(function () {
+        if (phone.img === img) connect(phone);
+      }, 1000);
+    };
+    connect(phone);
+
+    var next = null;
+    for (var i = phones.indexOf(phone) + 1; i < phones.length; i++) {
+      if (phones[i].tile) {
+        next = phones[i].tile;
+        break;
+      }
+    }
+    screens.insertBefore(tile, next);
+    relabel();
+  }
+
+  function hide(phone) {
+    if (!phone.tile) return;
+    var img = phone.img;
+    phone.img = null;
+    img.removeAttribute('src'); // обрывает поток, телефон перестаёт сжимать кадры
+    screens.removeChild(phone.tile);
+    phone.tile = null;
+    relabel();
+  }
+
+  function relabel() {
+    var count = 0;
+    phones.forEach(function (phone) {
+      if (phone.tile) phone.tile.lastChild.textContent = 'Телефон ' + (++count);
+    });
+    empty.style.display = count ? 'none' : '';
+  }
+
+  function tick() {
+    phones.forEach(poll);
+  }
+
+  // Подпись и кнопка прячутся, если пульт не трогали несколько секунд.
+  var idleTimer = null;
+  function wake() {
+    document.body.classList.remove('idle');
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () { document.body.classList.add('idle'); }, HIDE_UI_MS);
+  }
+  ['mousemove', 'keydown', 'click', 'touchstart'].forEach(function (type) {
+    document.addEventListener(type, wake);
+  });
+
+  var fullscreen = document.getElementById('fullscreen');
+  fullscreen.onclick = function () {
+    var root = document.documentElement;
+    var request = root.requestFullscreen || root.webkitRequestFullscreen;
+    var exit = document.exitFullscreen || document.webkitExitFullscreen;
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      if (exit) exit.call(document);
+    } else if (request) {
+      request.call(root);
+    }
+  };
+
+  // Телефон, который отдал эту страницу, плюс адреса из #хеша на случай,
+  // если роутер не пропускает Bonjour: http://адрес-1:8080/#адрес-2:8080
+  add(location.host);
+  location.hash.slice(1).split(',').forEach(add);
+  tick();
+  setInterval(tick, POLL_MS);
+  wake();
+  fullscreen.focus();
+})();
+</script>
+</body>
+</html>
