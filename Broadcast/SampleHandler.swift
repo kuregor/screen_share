@@ -4,6 +4,7 @@ import ReplayKit
 final class SampleHandler: RPBroadcastSampleHandler {
     private let processor = FrameProcessor()
     private let h264 = H264Encoder()
+    private let audio = AudioEncoder()
     private var server: StreamServer?
 
     // Обработка идёт и из потока ReplayKit, и по запросу ключевого кадра, поэтому под замком.
@@ -27,6 +28,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         h264.onFrame = { [weak server] frame, isKey, timestamp, quarterTurns in
             server?.broadcastVideo(frame, isKey: isKey, timestamp: timestamp, quarterTurns: quarterTurns)
         }
+        audio.onPacket = { [weak server] packet, timestamp in
+            server?.broadcastAudio(packet, timestamp: timestamp)
+        }
         do {
             try server.start()
         } catch {
@@ -42,7 +46,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
-        guard sampleBufferType == .video, let server else { return }
+        guard let server else { return }
+        switch sampleBufferType {
+        case .video:
+            processVideo(sampleBuffer, server: server)
+        case .audioApp:
+            // Звук идёт тем же сокетом, что и H.264. В режиме MJPEG звука нет.
+            if server.hasVideoViewers { audio.encode(sampleBuffer) }
+        default:
+            break
+        }
+    }
+
+    private func processVideo(_ sampleBuffer: CMSampleBuffer, server: StreamServer) {
         lock.lock()
         defer { lock.unlock() }
         latestSample = sampleBuffer

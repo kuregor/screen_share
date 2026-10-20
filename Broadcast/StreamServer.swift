@@ -114,15 +114,27 @@ final class StreamServer {
     }
 
     func broadcastVideo(_ frame: Data, isKey: Bool, timestamp: UInt32, quarterTurns: UInt8) {
+        send(frame, flags: (isKey ? 1 : 0) | (quarterTurns & 3) << 1, timestamp: timestamp)
+    }
+
+    func broadcastAudio(_ packet: Data, timestamp: UInt32) {
+        send(packet, flags: 0x80, timestamp: timestamp)
+    }
+
+    /// Флаги: бит 0 — ключевой кадр, биты 1–2 — поворот, бит 7 — звук (кадр AAC с заголовком ADTS).
+    private func send(_ payload: Data, flags: UInt8, timestamp: UInt32) {
+        let isAudio = flags & 0x80 != 0
+        let isKey = flags & 1 != 0
         queue.async {
-            var packet = Data([(isKey ? 1 : 0) | (quarterTurns & 3) << 1])
+            var packet = Data([flags])
             withUnsafeBytes(of: timestamp.bigEndian) { packet.append(contentsOf: $0) }
-            packet.append(frame)
+            packet.append(payload)
 
             var needsKeyFrame = false
             for viewer in self.videoViewers {
                 // P-кадр бесполезен без предыдущих, поэтому после пропуска ждём ключевой.
-                if viewer.waitingForKey {
+                // Звук от видеокадров не зависит и идёт всегда.
+                if viewer.waitingForKey, !isAudio {
                     guard isKey else { continue }
                     viewer.waitingForKey = false
                 }
