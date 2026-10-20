@@ -2,6 +2,7 @@ import Foundation
 
 enum LocalNetwork {
     static let port: UInt16 = 8080
+    static let videoPort: UInt16 = 8081
     static let serviceType = "_screenshare._tcp"
 
     /// IPv4-адрес телефона в сети Wi-Fi (интерфейс en0) или nil, если Wi-Fi не подключён.

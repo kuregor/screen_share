@@ -14,11 +14,25 @@
     color: #e8e8e8;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  /* Браузер телевизора может быть старым Chromium: без gap и inset, только flex и отступы. */
-  #screens { display: flex; height: 100%; padding: 1vh 1vw; }
-  .screen { position: relative; flex: 1 1 0; min-width: 0; }
+  /* Браузер телевизора может быть старым Chromium: без gap и inset.
+     Картинка позиционируется абсолютно: процентная высота внутри flex-элемента
+     в старых движках не работает, и экран телефона обрезался снизу. */
+  #screens {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    display: flex;
+    padding: 1vh 1vw;
+  }
+  .screen { position: relative; flex: 1 1 0%; min-width: 0; }
   .screen + .screen { margin-left: 1vw; }
-  .screen img { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .screen img, .screen video {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+  }
   .label {
     position: absolute;
     top: 2vh;
@@ -67,6 +81,7 @@
   <p>Телефон и телевизор должны быть в одной сети Wi-Fi.</p>
 </div>
 <div id="bar"><button id="fullscreen" type="button">Во весь экран</button></div>
+<script src="jmuxer.min.js"></script>
 <script>
 // Только ES5: встроенный браузер старых телевизоров LG не знает let, стрелочные функции и async.
 (function () {
@@ -75,6 +90,12 @@
   var POLL_MS = 2000;
   var MAX_FAILS = 3;
   var HIDE_UI_MS = 4000;
+  var VIDEO_START_MS = 8000;
+  var MAX_LAG_S = 0.5;
+
+  // H.264 через Media Source Extensions. Если браузер не умеет, показываем MJPEG.
+  var canPlayVideo = !!(window.JMuxer && window.MediaSource &&
+    MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'));
 
   // Телефоны в порядке обнаружения: первый показывается слева.
   var phones = [];
@@ -89,7 +110,9 @@
   }
 
   function add(host) {
-    if (host && !find(host)) phones.push({ host: host, fails: 0, tile: null, img: null });
+    if (host && !find(host)) {
+      phones.push({ host: host, fails: 0, tile: null, media: null, mode: '', fps: 0, noVideo: false });
+    }
   }
 
   // Каждый телефон отвечает, жив ли он, и сообщает адреса соседей, найденных через Bonjour.
@@ -106,6 +129,7 @@
         return;
       }
       phone.fails = 0;
+      phone.videoPort = status.video;
       show(phone);
       (status.peers || []).forEach(add);
     };
@@ -118,29 +142,21 @@
     if (phone.fails >= MAX_FAILS) hide(phone);
   }
 
-  function connect(phone) {
-    phone.img.src = 'http://' + phone.host + '/stream?t=' + Date.now();
-  }
-
   function show(phone) {
     if (phone.tile) return;
     var tile = document.createElement('div');
-    var img = document.createElement('img');
     var label = document.createElement('div');
     tile.className = 'screen';
     label.className = 'label';
-    tile.appendChild(img);
     tile.appendChild(label);
     phone.tile = tile;
-    phone.img = img;
+    phone.label = label;
 
-    // Поток оборвался, а телефон ещё отвечает на /status: переподключаемся.
-    img.onerror = function () {
-      setTimeout(function () {
-        if (phone.img === img) connect(phone);
-      }, 1000);
-    };
-    connect(phone);
+    if (canPlayVideo && phone.videoPort && !phone.noVideo) {
+      startVideo(phone);
+    } else {
+      startJpeg(phone);
+    }
 
     var next = null;
     for (var i = phones.indexOf(phone) + 1; i < phones.length; i++) {
@@ -155,18 +171,188 @@
 
   function hide(phone) {
     if (!phone.tile) return;
-    var img = phone.img;
-    phone.img = null;
-    img.removeAttribute('src'); // обрывает поток, телефон перестаёт сжимать кадры
+    stopMedia(phone);
     screens.removeChild(phone.tile);
     phone.tile = null;
     relabel();
   }
 
+  function setMedia(phone, element, mode) {
+    phone.media = element;
+    phone.mode = mode;
+    phone.fps = 0;
+    phone.tile.insertBefore(element, phone.label);
+  }
+
+  function stopMedia(phone) {
+    var media = phone.media;
+    phone.media = null;
+    clearTimeout(phone.startTimer);
+    if (phone.ws) {
+      var ws = phone.ws;
+      phone.ws = null;
+      ws.close();
+    }
+    if (phone.muxer) {
+      try { phone.muxer.destroy(); } catch (e) {}
+      phone.muxer = null;
+    }
+    if (media) {
+      media.removeAttribute('src'); // обрывает поток, телефон перестаёт сжимать кадры
+      if (media.load) media.load();
+      media.parentNode.removeChild(media);
+    }
+  }
+
+  // --- MJPEG ---
+
+  function startJpeg(phone) {
+    var img = document.createElement('img');
+    setMedia(phone, img, 'MJPEG');
+    // Поток оборвался, а телефон ещё отвечает на /status: переподключаемся.
+    img.onerror = function () {
+      setTimeout(function () {
+        if (phone.media === img) connectJpeg(phone);
+      }, 1000);
+    };
+    connectJpeg(phone);
+  }
+
+  function connectJpeg(phone) {
+    phone.media.src = 'http://' + phone.host + '/stream?t=' + Date.now();
+  }
+
+  // --- H.264 ---
+
+  function startVideo(phone) {
+    var video = document.createElement('video');
+    video.muted = true;
+    video.autoplay = true;
+    video.setAttribute('playsinline', '');
+    setMedia(phone, video, 'H.264');
+    phone.sps = null;
+    phone.frames = 0;
+    phone.decoded = decodedFrames(video);
+    openSocket(phone, video);
+
+    // Видео так и не пошло: значит, браузер не справляется с H.264. Переходим на MJPEG.
+    phone.startTimer = setTimeout(function () {
+      if (phone.media === video && video.readyState < 2) {
+        phone.noVideo = true;
+        stopMedia(phone);
+        startJpeg(phone);
+        relabel();
+      }
+    }, VIDEO_START_MS);
+  }
+
+  function openSocket(phone, video) {
+    var ws = new WebSocket('ws://' + phone.host.split(':')[0] + ':' + phone.videoPort + '/');
+    ws.binaryType = 'arraybuffer';
+    phone.ws = ws;
+    ws.onmessage = function (event) {
+      if (phone.ws === ws) feed(phone, event.data);
+    };
+    ws.onclose = function () {
+      if (phone.ws !== ws) return;
+      phone.ws = null;
+      setTimeout(function () {
+        if (phone.media === video) openSocket(phone, video);
+      }, 1000);
+    };
+  }
+
+  // Сообщение: 1 байт флагов (бит 0 — ключевой кадр), 4 байта времени в мс, затем кадр в Annex B.
+  function feed(phone, buffer) {
+    var bytes = new Uint8Array(buffer);
+    var isKey = (bytes[0] & 1) === 1;
+    var time = new DataView(buffer).getUint32(1);
+    var frame = bytes.subarray(5);
+
+    if (isKey) {
+      // Телефон повернули — разрешение и SPS сменились. Плеер нужно пересоздать.
+      var sps = findSps(frame);
+      if (sps !== null && sps !== phone.sps) {
+        resetMuxer(phone);
+        phone.sps = sps;
+      }
+    }
+    if (!phone.muxer) return; // ждём ключевой кадр
+
+    var duration = phone.lastTime === null ? 33 : Math.max(1, Math.min(100, time - phone.lastTime));
+    phone.lastTime = time;
+    phone.frames++;
+    phone.muxer.feed({ video: frame, duration: duration });
+  }
+
+  function resetMuxer(phone) {
+    if (phone.muxer) {
+      try { phone.muxer.destroy(); } catch (e) {}
+    }
+    phone.lastTime = null;
+    phone.muxer = new JMuxer({
+      node: phone.media,
+      mode: 'video',
+      flushingTime: 0,
+      clearBuffer: true,
+      fps: 30,
+      debug: false,
+      onError: function () {
+        // Плеер сломался — пересоздадим его на следующем ключевом кадре.
+        phone.sps = null;
+      }
+    });
+  }
+
+  // SPS (NAL типа 7) телефон ставит первым в ключевом кадре. Возвращает его байты строкой.
+  function findSps(frame) {
+    if (frame.length < 5 || (frame[4] & 0x1f) !== 7) return null;
+    var end = 5;
+    while (end + 3 < frame.length &&
+      !(frame[end] === 0 && frame[end + 1] === 0 && (frame[end + 2] === 1 || (frame[end + 2] === 0 && frame[end + 3] === 1)))) {
+      end++;
+    }
+    return Array.prototype.join.call(frame.subarray(4, end), ',');
+  }
+
+  function decodedFrames(video) {
+    if (video.getVideoPlaybackQuality) return video.getVideoPlaybackQuality().totalVideoFrames;
+    return video.webkitDecodedFrameCount || 0;
+  }
+
+  // Плеер браузера копит буфер, и задержка растёт. Держим видео у живого края.
+  function keepLive() {
+    phones.forEach(function (phone) {
+      var video = phone.media;
+      if (!video || phone.mode !== 'H.264' || !video.buffered.length) return;
+      var end = video.buffered.end(video.buffered.length - 1);
+      if (end - video.currentTime > MAX_LAG_S) video.currentTime = end - 0.05;
+      if (video.paused) {
+        var playing = video.play();
+        if (playing && playing.catch) playing.catch(function () {});
+      }
+    });
+  }
+
+  function measureFps() {
+    phones.forEach(function (phone) {
+      if (!phone.media || phone.mode !== 'H.264') return;
+      var decoded = decodedFrames(phone.media);
+      phone.fps = Math.round((decoded - phone.decoded) / 2);
+      phone.decoded = decoded;
+    });
+    relabel();
+  }
+
+  // --- Общее ---
+
   function relabel() {
     var count = 0;
     phones.forEach(function (phone) {
-      if (phone.tile) phone.tile.lastChild.textContent = 'Телефон ' + (++count);
+      if (!phone.tile) return;
+      var text = 'Телефон ' + (++count) + ' · ' + phone.mode;
+      if (phone.mode === 'H.264' && phone.fps > 0) text += ' · ' + phone.fps + ' к/с';
+      phone.label.textContent = text;
     });
     empty.style.display = count ? 'none' : '';
   }
@@ -204,6 +390,8 @@
   location.hash.slice(1).split(',').forEach(add);
   tick();
   setInterval(tick, POLL_MS);
+  setInterval(keepLive, 500);
+  setInterval(measureFps, 2000);
   wake();
   fullscreen.focus();
 })();

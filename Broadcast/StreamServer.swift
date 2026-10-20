@@ -1,37 +1,49 @@
 import Foundation
 import Network
 
-/// HTTP-сервер внутри телефона. Телевизор открывает его в браузере.
+/// Сервер внутри телефона. Телевизор открывает его в браузере.
 ///
-/// Маршруты:
-/// - `/` — страница для телевизора (tv.html);
-/// - `/stream` — экран телефона потоком MJPEG;
+/// HTTP на порту `LocalNetwork.port`:
+/// - `/` — страница для телевизора (tv.html), `/jmuxer.min.js` — библиотека для неё;
+/// - `/stream` — экран потоком MJPEG, запасной вариант для старых браузеров;
 /// - `/status` — JSON с адресами других телефонов, найденных через Bonjour.
 ///   По нему страница сама подключает второй телефон.
+///
+/// WebSocket на порту `LocalNetwork.videoPort` — экран в H.264. Каждое сообщение:
+/// 1 байт флагов (бит 0 — ключевой кадр), 4 байта времени кадра в мс (big-endian), затем кадр в Annex B.
 final class StreamServer {
     var onFailure: ((Error) -> Void)?
+    /// Новому зрителю H.264 нужен ключевой кадр, без него видео не начнётся.
+    var onKeyFrameNeeded: (() -> Void)?
 
     private let ownHost: String
     private let queue = DispatchQueue(label: "StreamServer")
     private var listener: NWListener?
+    private var videoListener: NWListener?
     private var browser: NWBrowser?
-    private var viewers: [Viewer] = []
+    private var jpegViewers: [JPEGViewer] = []
+    private var videoViewers: [VideoViewer] = []
     private var peers: [String] = []
-    private var lastFrame: Data?
+    private var lastJPEG: Data?
 
     private let lock = NSLock()
-    private var viewerCount = 0
+    private var jpegViewerCount = 0
+    private var videoViewerCount = 0
 
-    private lazy var page: Data = {
-        Bundle(for: StreamServer.self).url(forResource: "tv", withExtension: "html")
-            .flatMap { try? Data(contentsOf: $0) } ?? Data("tv.html не найден".utf8)
-    }()
+    private lazy var page = Self.resource("tv", "html")
+    private lazy var jmuxer = Self.resource("jmuxer.min", "js")
 
-    /// Читается из потока ReplayKit, поэтому под замком.
-    var hasViewers: Bool {
+    // Читаются из потока ReplayKit, поэтому под замком.
+    var hasJPEGViewers: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return viewerCount > 0
+        return jpegViewerCount > 0
+    }
+
+    var hasVideoViewers: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return videoViewerCount > 0
     }
 
     init(address: String) {
@@ -39,20 +51,34 @@ final class StreamServer {
     }
 
     func start() throws {
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: LocalNetwork.port)!)
+        let http = NWParameters.tcp
+        http.allowLocalEndpointReuse = true
+        let listener = try NWListener(using: http, on: NWEndpoint.Port(rawValue: LocalNetwork.port)!)
         // Адрес кладём в TXT-запись, чтобы соседям не пришлось резолвить имя сервиса.
         listener.service = NWListener.Service(name: "iPhone \(ownHost)", type: LocalNetwork.serviceType,
                                               domain: nil, txtRecord: NWTXTRecord(["host": ownHost]))
-        listener.stateUpdateHandler = { [weak self] state in
-            if case .failed(let error) = state { self?.onFailure?(error) }
-        }
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
-        listener.start(queue: queue)
+
+        let webSocket = NWProtocolWebSocket.Options()
+        webSocket.autoReplyPing = true
+        let ws = NWParameters.tcp
+        ws.allowLocalEndpointReuse = true
+        ws.defaultProtocolStack.applicationProtocols.insert(webSocket, at: 0)
+        let videoListener = try NWListener(using: ws, on: NWEndpoint.Port(rawValue: LocalNetwork.videoPort)!)
+        videoListener.newConnectionHandler = { [weak self] connection in
+            self?.acceptVideo(connection)
+        }
+
+        for item in [listener, videoListener] {
+            item.stateUpdateHandler = { [weak self] state in
+                if case .failed(let error) = state { self?.onFailure?(error) }
+            }
+            item.start(queue: queue)
+        }
         self.listener = listener
+        self.videoListener = videoListener
 
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: LocalNetwork.serviceType, domain: nil), using: .tcp)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
@@ -65,21 +91,50 @@ final class StreamServer {
     func stop() {
         queue.async {
             self.listener?.cancel()
+            self.videoListener?.cancel()
             self.browser?.cancel()
-            self.viewers.forEach { $0.connection.cancel() }
-            self.viewers.removeAll()
-            self.updateViewerCount()
+            self.jpegViewers.forEach { $0.connection.cancel() }
+            self.videoViewers.forEach { $0.connection.cancel() }
+            self.jpegViewers.removeAll()
+            self.videoViewers.removeAll()
+            self.updateViewerCounts()
         }
     }
 
     func broadcast(_ jpeg: Data) {
         queue.async {
-            self.lastFrame = jpeg
-            self.viewers.forEach { self.send(jpeg, to: $0) }
+            self.lastJPEG = jpeg
+            self.jpegViewers.forEach { self.send(jpeg, to: $0) }
         }
     }
 
-    // MARK: - Соединения
+    func broadcastVideo(_ frame: Data, isKey: Bool, timestamp: UInt32) {
+        queue.async {
+            var packet = Data([isKey ? 1 : 0])
+            withUnsafeBytes(of: timestamp.bigEndian) { packet.append(contentsOf: $0) }
+            packet.append(frame)
+
+            var needsKeyFrame = false
+            for viewer in self.videoViewers {
+                // P-кадр бесполезен без предыдущих, поэтому после пропуска ждём ключевой.
+                if viewer.waitingForKey {
+                    guard isKey else { continue }
+                    viewer.waitingForKey = false
+                }
+                viewer.queue.append(packet)
+                // Wi-Fi не успевает: выбрасываем очередь, чтобы не копить задержку, и просим ключевой кадр.
+                if viewer.queue.count > 15 {
+                    viewer.queue.removeAll()
+                    viewer.waitingForKey = true
+                    needsKeyFrame = true
+                }
+                self.pump(viewer)
+            }
+            if needsKeyFrame { self.onKeyFrameNeeded?() }
+        }
+    }
+
+    // MARK: - HTTP
 
     private func accept(_ connection: NWConnection) {
         connection.stateUpdateHandler = { [weak self] state in
@@ -116,12 +171,14 @@ final class StreamServer {
         switch path {
         case "/":
             respond(connection, type: "text/html; charset=utf-8", body: page)
+        case "/jmuxer.min.js":
+            respond(connection, type: "application/javascript", body: jmuxer)
         case "/status":
-            let status: [String: Any] = ["host": ownHost, "peers": peers]
+            let status: [String: Any] = ["host": ownHost, "video": Int(LocalNetwork.videoPort), "peers": peers]
             let body = (try? JSONSerialization.data(withJSONObject: status)) ?? Data()
             respond(connection, type: "application/json", body: body)
         case "/stream":
-            startStream(connection)
+            startJPEGStream(connection)
         default:
             respond(connection, status: "404 Not Found", type: "text/plain", body: Data("Not found".utf8))
         }
@@ -140,8 +197,9 @@ final class StreamServer {
     }
 
     private func drop(_ connection: NWConnection) {
-        viewers.removeAll { $0.connection === connection }
-        updateViewerCount()
+        jpegViewers.removeAll { $0.connection === connection }
+        videoViewers.removeAll { $0.connection === connection }
+        updateViewerCounts()
     }
 
     private func updatePeers(_ results: Set<NWBrowser.Result>) {
@@ -153,9 +211,21 @@ final class StreamServer {
         }.sorted()
     }
 
+    private func updateViewerCounts() {
+        lock.lock()
+        jpegViewerCount = jpegViewers.count
+        videoViewerCount = videoViewers.count
+        lock.unlock()
+    }
+
+    private static func resource(_ name: String, _ ext: String) -> Data {
+        Bundle(for: StreamServer.self).url(forResource: name, withExtension: ext)
+            .flatMap { try? Data(contentsOf: $0) } ?? Data("\(name).\(ext) не найден".utf8)
+    }
+
     // MARK: - Поток MJPEG
 
-    private final class Viewer {
+    private final class JPEGViewer {
         let connection: NWConnection
         var sending = false
         var pending: Data?
@@ -165,7 +235,7 @@ final class StreamServer {
         }
     }
 
-    private func startStream(_ connection: NWConnection) {
+    private func startJPEGStream(_ connection: NWConnection) {
         // Разделитель ставим сразу после каждого кадра: так Chrome показывает кадр,
         // не дожидаясь начала следующего.
         let head = "HTTP/1.1 200 OK\r\n"
@@ -175,16 +245,16 @@ final class StreamServer {
             + "--frame\r\n"
         connection.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
 
-        let viewer = Viewer(connection: connection)
-        viewers.append(viewer)
-        updateViewerCount()
+        let viewer = JPEGViewer(connection: connection)
+        jpegViewers.append(viewer)
+        updateViewerCounts()
         // Если экран телефона не меняется, новых кадров нет. Отдаём последний, чтобы не было чёрного экрана.
-        if let lastFrame { send(lastFrame, to: viewer) }
+        if let lastJPEG { send(lastJPEG, to: viewer) }
     }
 
     /// Пока предыдущий кадр не ушёл, новый не шлём, а запоминаем последний.
     /// Так медленный Wi-Fi не копит задержку: телевизор всегда получает свежий кадр.
-    private func send(_ jpeg: Data, to viewer: Viewer) {
+    private func send(_ jpeg: Data, to viewer: JPEGViewer) {
         guard !viewer.sending else {
             viewer.pending = jpeg
             return
@@ -203,9 +273,65 @@ final class StreamServer {
         })
     }
 
-    private func updateViewerCount() {
-        lock.lock()
-        viewerCount = viewers.count
-        lock.unlock()
+    // MARK: - Поток H.264
+
+    private final class VideoViewer {
+        let connection: NWConnection
+        var queue: [Data] = []
+        var sending = false
+        var waitingForKey = true
+
+        init(connection: NWConnection) {
+            self.connection = connection
+        }
+    }
+
+    private func acceptVideo(_ connection: NWConnection) {
+        let viewer = VideoViewer(connection: connection)
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                guard let self else { return }
+                self.videoViewers.append(viewer)
+                self.updateViewerCounts()
+                self.onKeyFrameNeeded?()
+            case .failed, .cancelled:
+                self?.drop(connection)
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        receiveVideoMessages(connection)
+    }
+
+    /// Страница ничего не шлёт, но читать входящие нужно: так обрабатываются ping и закрытие сокета.
+    private func receiveVideoMessages(_ connection: NWConnection) {
+        connection.receiveMessage { [weak self] _, context, _, error in
+            let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
+                as? NWProtocolWebSocket.Metadata
+            if error != nil || metadata?.opcode == .close {
+                connection.cancel()
+            } else {
+                self?.receiveVideoMessages(connection)
+            }
+        }
+    }
+
+    private func pump(_ viewer: VideoViewer) {
+        guard !viewer.sending, !viewer.queue.isEmpty else { return }
+        viewer.sending = true
+        let packet = viewer.queue.removeFirst()
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .binary)
+        let context = NWConnection.ContentContext(identifier: "frame", metadata: [metadata])
+        viewer.connection.send(content: packet, contentContext: context, isComplete: true,
+                               completion: .contentProcessed { [weak self] error in
+            viewer.sending = false
+            if error != nil {
+                viewer.connection.cancel()
+            } else {
+                self?.pump(viewer)
+            }
+        })
     }
 }
