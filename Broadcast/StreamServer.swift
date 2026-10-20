@@ -6,53 +6,67 @@ import Network
 /// HTTP на порту `LocalNetwork.port`:
 /// - `/` — страница для телевизора (tv.html), `/jmuxer.min.js` — библиотека для неё;
 /// - `/stream` — экран потоком MJPEG, запасной вариант для старых браузеров;
-/// - `/status` — JSON с адресами других телефонов, найденных через Bonjour.
+/// - `/status` — JSON с портами, токеном сокетов и адресами других телефонов, найденных через Bonjour.
 ///   По нему страница сама подключает второй телефон;
 /// - `/msx/start.json`, `/msx/content.json` — запуск через приложение Media Station X на телевизоре;
-/// - `/log` — журнал диагностики, который пишет страница телевизора.
+/// - `/log` — журнал диагностики: пишут страница телевизора и само расширение.
 ///
 /// WebSocket на порту `LocalNetwork.videoPort` — экран в H.264. Каждое сообщение:
 /// 1 байт флагов (бит 0 — ключевой кадр, биты 1–2 — сколько четвертей оборота по часовой
 /// повернуть кадр при показе), 4 байта времени кадра в мс (big-endian), затем кадр в Annex B.
+/// Страница шлёт обратно текстом свои цифры: {"fps": показано, "rx": принято, "lag": отставание}.
+///
+/// WebSocket на порту `LocalNetwork.audioPort` — звук: 1 байт флагов (0x80), 4 байта времени,
+/// затем кадр AAC с заголовком ADTS. Отдельное соединение нужно, чтобы тяжёлый ключевой кадр
+/// видео не задерживал звук.
+///
+/// Защита. Сокеты принимают только подпротокол `t-<токен>`. Токен отдаёт `/status`, а прочитать
+/// ответ `/status` из браузера можно только со страницы, загруженной с телефона в локальной сети
+/// (CORS). Так чужой сайт, открытый на любом устройстве в этой же сети, не утащит экран телефона.
 final class StreamServer {
+    struct ViewerStats {
+        let shownFps: Int
+        let receivedFps: Int
+        let lag: Double
+    }
+
     var onFailure: ((Error) -> Void)?
     /// Новому зрителю H.264 нужен ключевой кадр, без него видео не начнётся.
     var onKeyFrameNeeded: (() -> Void)?
+    /// Очередь зрителя переполнилась: Wi-Fi не успевает за битрейтом.
+    var onCongestion: (() -> Void)?
+    /// Цифры, которые прислала страница телевизора.
+    var onViewerStats: ((ViewerStats) -> Void)?
 
     private let ownHost: String
+    private let token: String
     private let queue = DispatchQueue(label: "StreamServer")
-    private var listener: NWListener?
-    private var videoListener: NWListener?
+    private var listeners: [NWListener] = []
     private var browser: NWBrowser?
     private var jpegViewers: [JPEGViewer] = []
-    private var videoViewers: [VideoViewer] = []
+    private var videoViewers: [SocketViewer] = []
+    private var audioViewers: [SocketViewer] = []
     private var peers: [String] = []
     private var lastJPEG: Data?
-    private var log: [String] = []
+    private var logLines: [String] = []
     private let logStart = Date()
 
     private let lock = NSLock()
     private var jpegViewerCount = 0
     private var videoViewerCount = 0
+    private var audioViewerCount = 0
 
     private lazy var page = Self.resource("tv", "html")
     private lazy var jmuxer = Self.resource("jmuxer.min", "js")
 
     // Читаются из потока ReplayKit, поэтому под замком.
-    var hasJPEGViewers: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return jpegViewerCount > 0
-    }
-
-    var hasVideoViewers: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return videoViewerCount > 0
-    }
+    var hasJPEGViewers: Bool { counted { jpegViewerCount > 0 } }
+    var hasVideoViewers: Bool { counted { videoViewerCount > 0 } }
+    var hasAudioViewers: Bool { counted { audioViewerCount > 0 } }
 
     init(address: String) {
         ownHost = "\(address):\(LocalNetwork.port)"
+        token = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
     }
 
     func start() throws {
@@ -66,24 +80,20 @@ final class StreamServer {
             self?.accept(connection)
         }
 
-        let webSocket = NWProtocolWebSocket.Options()
-        webSocket.autoReplyPing = true
-        let ws = NWParameters.tcp
-        ws.allowLocalEndpointReuse = true
-        ws.defaultProtocolStack.applicationProtocols.insert(webSocket, at: 0)
-        let videoListener = try NWListener(using: ws, on: NWEndpoint.Port(rawValue: LocalNetwork.videoPort)!)
-        videoListener.newConnectionHandler = { [weak self] connection in
-            self?.acceptVideo(connection)
+        let videoListener = try makeSocketListener(port: LocalNetwork.videoPort) { [weak self] connection in
+            self?.acceptSocket(connection, isVideo: true)
+        }
+        let audioListener = try makeSocketListener(port: LocalNetwork.audioPort) { [weak self] connection in
+            self?.acceptSocket(connection, isVideo: false)
         }
 
-        for item in [listener, videoListener] {
+        listeners = [listener, videoListener, audioListener]
+        for item in listeners {
             item.stateUpdateHandler = { [weak self] state in
                 if case .failed(let error) = state { self?.onFailure?(error) }
             }
             item.start(queue: queue)
         }
-        self.listener = listener
-        self.videoListener = videoListener
 
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: LocalNetwork.serviceType, domain: nil), using: .tcp)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
@@ -95,15 +105,20 @@ final class StreamServer {
 
     func stop() {
         queue.async {
-            self.listener?.cancel()
-            self.videoListener?.cancel()
+            self.listeners.forEach { $0.cancel() }
             self.browser?.cancel()
             self.jpegViewers.forEach { $0.connection.cancel() }
-            self.videoViewers.forEach { $0.connection.cancel() }
+            (self.videoViewers + self.audioViewers).forEach { $0.connection.cancel() }
             self.jpegViewers.removeAll()
             self.videoViewers.removeAll()
+            self.audioViewers.removeAll()
             self.updateViewerCounts()
         }
+    }
+
+    /// Запись в журнал `/log` от самого расширения.
+    func log(_ message: String) {
+        queue.async { self.appendLog("телефон: " + message) }
     }
 
     func broadcast(_ jpeg: Data) {
@@ -114,42 +129,56 @@ final class StreamServer {
     }
 
     func broadcastVideo(_ frame: Data, isKey: Bool, timestamp: UInt32, quarterTurns: UInt8) {
-        send(frame, flags: (isKey ? 1 : 0) | (quarterTurns & 3) << 1, timestamp: timestamp)
-    }
-
-    func broadcastAudio(_ packet: Data, timestamp: UInt32) {
-        send(packet, flags: 0x80, timestamp: timestamp)
-    }
-
-    /// Флаги: бит 0 — ключевой кадр, биты 1–2 — поворот, бит 7 — звук (кадр AAC с заголовком ADTS).
-    private func send(_ payload: Data, flags: UInt8, timestamp: UInt32) {
-        let isAudio = flags & 0x80 != 0
-        let isKey = flags & 1 != 0
+        let flags = (isKey ? 1 : 0) | (quarterTurns & 3) << 1
+        let packet = Self.packet(frame, flags: flags, timestamp: timestamp)
         queue.async {
-            var packet = Data([flags])
-            withUnsafeBytes(of: timestamp.bigEndian) { packet.append(contentsOf: $0) }
-            packet.append(payload)
-
-            var needsKeyFrame = false
+            var congested = false
             for viewer in self.videoViewers {
                 // P-кадр бесполезен без предыдущих, поэтому после пропуска ждём ключевой.
-                // Звук от видеокадров не зависит и идёт всегда.
-                if viewer.waitingForKey, !isAudio {
+                if viewer.waitingForKey {
                     guard isKey else { continue }
                     viewer.waitingForKey = false
                 }
                 viewer.queue.append(packet)
-                // Wi-Fi не успевает: выбрасываем очередь, чтобы не копить задержку, и просим ключевой кадр.
+                // Wi-Fi не успевает: выбрасываем очередь, чтобы не копить задержку, и ждём ключевой кадр.
                 // 30 кадров — около полсекунды при 60 к/с.
                 if viewer.queue.count > 30 {
                     viewer.queue.removeAll()
                     viewer.waitingForKey = true
-                    needsKeyFrame = true
+                    congested = true
                 }
                 self.pump(viewer)
             }
-            if needsKeyFrame { self.onKeyFrameNeeded?() }
+            if congested {
+                self.onCongestion?()
+                self.onKeyFrameNeeded?()
+            }
         }
+    }
+
+    func broadcastAudio(_ frame: Data, timestamp: UInt32) {
+        let packet = Self.packet(frame, flags: 0x80, timestamp: timestamp)
+        queue.async {
+            for viewer in self.audioViewers {
+                viewer.queue.append(packet)
+                // Около секунды звука. Если не успевает уйти, старое выбрасываем: лучше пропуск, чем задержка.
+                if viewer.queue.count > 50 { viewer.queue.removeFirst(viewer.queue.count - 50) }
+                self.pump(viewer)
+            }
+        }
+    }
+
+    private static func packet(_ payload: Data, flags: UInt8, timestamp: UInt32) -> Data {
+        var packet = Data([flags])
+        withUnsafeBytes(of: timestamp.bigEndian) { packet.append(contentsOf: $0) }
+        packet.append(payload)
+        return packet
+    }
+
+    private func counted(_ read: () -> Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return read()
     }
 
     // MARK: - HTTP
@@ -183,10 +212,13 @@ final class StreamServer {
 
     private func route(_ head: String, _ connection: NWConnection) {
         // Первая строка запроса: "GET /stream?t=123 HTTP/1.1".
-        let target = head.split(separator: " ", maxSplits: 2).dropFirst().first ?? ""
+        let lines = head.components(separatedBy: "\r\n")
+        let target = lines[0].split(separator: " ", maxSplits: 2).dropFirst().first ?? ""
         let parts = target.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
         let path = parts.first ?? ""
         let query = parts.count > 1 ? String(parts[1]) : ""
+        let origin = lines.dropFirst().first { $0.lowercased().hasPrefix("origin:") }
+            .map { $0.dropFirst("origin:".count).trimmingCharacters(in: .whitespaces) }
 
         switch path {
         case "/log":
@@ -196,36 +228,57 @@ final class StreamServer {
                 appendLog(message)
                 respond(connection, type: "text/plain", body: Data("ok".utf8))
             } else {
-                respond(connection, type: "text/plain; charset=utf-8", body: Data(log.joined(separator: "\n").utf8))
+                respond(connection, type: "text/plain; charset=utf-8", body: Data(logLines.joined(separator: "\n").utf8))
             }
         case "/":
             respond(connection, type: "text/html; charset=utf-8", body: page)
         case "/jmuxer.min.js":
             respond(connection, type: "application/javascript", body: jmuxer)
         case "/status":
-            let status: [String: Any] = ["host": ownHost, "video": Int(LocalNetwork.videoPort), "peers": peers]
-            respond(connection, type: "application/json", body: Self.json(status))
+            let status: [String: Any] = ["host": ownHost, "video": Int(LocalNetwork.videoPort),
+                                         "audio": Int(LocalNetwork.audioPort), "token": token, "peers": peers]
+            // В ответе токен, поэтому читать его разрешаем только страницам с телефонов в локальной сети.
+            respond(connection, type: "application/json", body: Self.json(status),
+                    allowOrigin: origin.flatMap { Self.isLocalPage($0) ? $0 : nil })
         case "/stream":
             startJPEGStream(connection)
         case "/msx/start.json":
             // Media Station X: «Стартовый параметр» = адрес телефона. {SERVER} приложение подставит само.
+            // MSX загружает файл со своего сайта, поэтому CORS открыт; секретов здесь нет.
             let start = ["name": "Экран на ТВ", "version": "1.0.0",
                          "parameter": "content:http://{SERVER}/msx/content.json"]
-            respond(connection, type: "application/json", body: Self.json(start))
+            respond(connection, type: "application/json", body: Self.json(start), allowOrigin: "*")
         case "/msx/content.json":
-            respond(connection, type: "application/json", body: Self.json(msxContent))
+            respond(connection, type: "application/json", body: Self.json(msxContent), allowOrigin: "*")
         default:
             respond(connection, status: "404 Not Found", type: "text/plain", body: Data("Not found".utf8))
         }
     }
 
-    private func respond(_ connection: NWConnection, status: String = "200 OK", type: String, body: Data) {
-        let head = "HTTP/1.1 \(status)\r\n"
+    /// Страница, загруженная с телефона в локальной сети: http://<частный IPv4>:<порт сервера>.
+    private static func isLocalPage(_ origin: String) -> Bool {
+        guard let url = URL(string: origin), url.scheme == "http", url.port == Int(LocalNetwork.port),
+              let host = url.host else { return false }
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else { return false }
+        switch (octets[0], octets[1]) {
+        case (10, _), (192, 168): return true
+        case (172, let second): return (16...31).contains(second)
+        default: return false
+        }
+    }
+
+    private func respond(_ connection: NWConnection, status: String = "200 OK", type: String, body: Data,
+                         allowOrigin: String? = nil) {
+        var head = "HTTP/1.1 \(status)\r\n"
             + "Content-Type: \(type)\r\n"
             + "Content-Length: \(body.count)\r\n"
-            + "Access-Control-Allow-Origin: *\r\n"
             + "Cache-Control: no-store\r\n"
-            + "Connection: close\r\n\r\n"
+            + "Connection: close\r\n"
+        if let allowOrigin {
+            head += "Access-Control-Allow-Origin: \(allowOrigin)\r\nVary: Origin\r\n"
+        }
+        head += "\r\n"
         connection.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in
             connection.cancel()
         })
@@ -234,6 +287,7 @@ final class StreamServer {
     private func drop(_ connection: NWConnection) {
         jpegViewers.removeAll { $0.connection === connection }
         videoViewers.removeAll { $0.connection === connection }
+        audioViewers.removeAll { $0.connection === connection }
         updateViewerCounts()
     }
 
@@ -247,14 +301,15 @@ final class StreamServer {
     }
 
     private func appendLog(_ message: String) {
-        log.append(String(format: "%7.1f ", Date().timeIntervalSince(logStart)) + message)
-        if log.count > 300 { log.removeFirst(log.count - 300) }
+        logLines.append(String(format: "%7.1f ", Date().timeIntervalSince(logStart)) + message)
+        if logLines.count > 300 { logLines.removeFirst(logLines.count - 300) }
     }
 
     private func updateViewerCounts() {
         lock.lock()
         jpegViewerCount = jpegViewers.count
         videoViewerCount = videoViewers.count
+        audioViewerCount = audioViewers.count
         lock.unlock()
     }
 
@@ -330,9 +385,9 @@ final class StreamServer {
         })
     }
 
-    // MARK: - Поток H.264
+    // MARK: - Сокеты видео и звука
 
-    private final class VideoViewer {
+    private final class SocketViewer {
         let connection: NWConnection
         var queue: [Data] = []
         var sending = false
@@ -343,39 +398,69 @@ final class StreamServer {
         }
     }
 
-    private func acceptVideo(_ connection: NWConnection) {
-        let viewer = VideoViewer(connection: connection)
+    private func makeSocketListener(port: UInt16, accept: @escaping (NWConnection) -> Void) throws -> NWListener {
+        let options = NWProtocolWebSocket.Options()
+        options.autoReplyPing = true
+        // Пускаем только тех, кто знает токен из /status.
+        let expected = "t-" + token
+        options.setClientRequestHandler(queue) { subprotocols, _ in
+            subprotocols.contains(expected)
+                ? NWProtocolWebSocket.Response(status: .accept, subprotocol: expected)
+                : NWProtocolWebSocket.Response(status: .reject, subprotocol: nil)
+        }
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        parameters.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
+        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        listener.newConnectionHandler = accept
+        return listener
+    }
+
+    private func acceptSocket(_ connection: NWConnection, isVideo: Bool) {
+        let viewer = SocketViewer(connection: connection)
         connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
             switch state {
             case .ready:
-                guard let self else { return }
-                self.videoViewers.append(viewer)
-                self.updateViewerCounts()
-                self.onKeyFrameNeeded?()
+                if isVideo {
+                    self.videoViewers.append(viewer)
+                    self.updateViewerCounts()
+                    self.onKeyFrameNeeded?()
+                } else {
+                    self.audioViewers.append(viewer)
+                    self.updateViewerCounts()
+                }
             case .failed, .cancelled:
-                self?.drop(connection)
+                self.drop(connection)
             default:
                 break
             }
         }
         connection.start(queue: queue)
-        receiveVideoMessages(connection)
+        receiveMessages(connection)
     }
 
-    /// Страница ничего не шлёт, но читать входящие нужно: так обрабатываются ping и закрытие сокета.
-    private func receiveVideoMessages(_ connection: NWConnection) {
-        connection.receiveMessage { [weak self] _, context, _, error in
+    /// Читаем входящие: так обрабатываются ping и закрытие сокета, а по сокету видео
+    /// страница присылает свои цифры (сколько кадров принято и показано).
+    private func receiveMessages(_ connection: NWConnection) {
+        connection.receiveMessage { [weak self] data, context, _, error in
             let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
                 as? NWProtocolWebSocket.Metadata
             if error != nil || metadata?.opcode == .close {
                 connection.cancel()
-            } else {
-                self?.receiveVideoMessages(connection)
+                return
             }
+            if metadata?.opcode == .text, let data,
+               let stats = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                self?.onViewerStats?(ViewerStats(shownFps: stats["fps"] as? Int ?? 0,
+                                                 receivedFps: stats["rx"] as? Int ?? 0,
+                                                 lag: stats["lag"] as? Double ?? 0))
+            }
+            self?.receiveMessages(connection)
         }
     }
 
-    private func pump(_ viewer: VideoViewer) {
+    private func pump(_ viewer: SocketViewer) {
         guard !viewer.sending, !viewer.queue.isEmpty else { return }
         viewer.sending = true
         let packet = viewer.queue.removeFirst()

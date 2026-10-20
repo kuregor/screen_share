@@ -15,10 +15,38 @@ final class H264Encoder {
     private var width = 0
     private var height = 0
     private var lastTime = CMTime.invalid
+    private var bitrate = 12_000_000
+    private var frameRate = 60
     private let startCode = Data([0, 0, 0, 1])
 
     deinit {
         if let session { VTCompressionSessionInvalidate(session) }
+    }
+
+    /// Битрейт можно менять на ходу: кодировщик подхватит его со следующего кадра.
+    func setBitrate(_ bitsPerSecond: Int) {
+        queue.async {
+            self.bitrate = bitsPerSecond
+            if let session = self.session { self.applyRate(to: session) }
+        }
+    }
+
+    func setFrameRate(_ fps: Int) {
+        queue.async {
+            self.frameRate = fps
+            if let session = self.session { self.applyRate(to: session) }
+        }
+    }
+
+    /// Пик — в полтора раза выше среднего, ключевой кадр — не реже раза в 2 секунды.
+    private func applyRate(to session: VTCompressionSession) {
+        let properties: [CFString: Any] = [
+            kVTCompressionPropertyKey_AverageBitRate: bitrate,
+            kVTCompressionPropertyKey_DataRateLimits: [bitrate * 3 / 2 / 8, 1] as CFArray,
+            kVTCompressionPropertyKey_ExpectedFrameRate: frameRate,
+            kVTCompressionPropertyKey_MaxKeyFrameInterval: frameRate * 2,
+        ]
+        VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary)
     }
 
     /// `quarterTurns` — на сколько четвертей оборота по часовой повернуть кадр при показе.
@@ -73,13 +101,10 @@ final class H264Encoder {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_Main_AutoLevel,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
-            kVTCompressionPropertyKey_AverageBitRate: 12_000_000,
-            kVTCompressionPropertyKey_DataRateLimits: [18_000_000 / 8, 1] as CFArray,
-            kVTCompressionPropertyKey_ExpectedFrameRate: 60,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval: 120,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2,
         ]
         VTSessionSetProperties(created, propertyDictionary: properties as CFDictionary)
+        applyRate(to: created)
         VTCompressionSessionPrepareToEncodeFrames(created)
 
         session = created

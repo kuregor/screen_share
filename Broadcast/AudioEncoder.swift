@@ -7,24 +7,44 @@ import AVFoundation
 final class AudioEncoder {
     /// Готовый кадр ADTS и время в миллисекундах. Вызывается из внутренней очереди.
     var onPacket: ((Data, UInt32) -> Void)?
+    /// Сообщения для журнала диагностики: формат звука и ошибки.
+    var onLog: ((String) -> Void)?
 
     private let queue = DispatchQueue(label: "AudioEncoder")
     private var converter: AVAudioConverter?
     private var outputFormat: AVAudioFormat?
     private var pending: [AVAudioPCMBuffer] = []
     private var timestamp: UInt32 = 0
+    private var reported = Set<String>()
 
     /// Копирует звук из буфера ReplayKit сразу, а сжимает в своей очереди.
+    ///
+    /// ReplayKit на части версий iOS отдаёт звук приложений в big-endian, а AVAudioPCMBuffer
+    /// и кодировщик рассчитаны на родной порядок байтов. Такой звук копируется как есть
+    /// в буфер родного формата, и байты каждого сэмпла переставляются вручную.
     func encode(_ sampleBuffer: CMSampleBuffer) {
-        guard let description = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
-        let input = AVAudioFormat(cmAudioFormatDescription: description)
+        guard let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let source = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee else { return }
+        let bigEndian = source.mFormatFlags & kAudioFormatFlagIsBigEndian != 0
+        var native = source
+        native.mFormatFlags &= ~kAudioFormatFlagIsBigEndian
+        report("формат звука: \(Int(source.mSampleRate)) Гц, каналов \(source.mChannelsPerFrame), "
+               + "\(source.mBitsPerChannel) бит, " + (bigEndian ? "big-endian" : "little-endian"))
+
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frames > 0, let pcm = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: frames) else { return }
+        guard frames > 0 else { return }
+        guard let input = AVAudioFormat(streamDescription: &native),
+              let pcm = AVAudioPCMBuffer(pcmFormat: input, frameCapacity: frames) else {
+            report("звук: формат не поддерживается")
+            return
+        }
         pcm.frameLength = frames
         guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: Int32(frames),
                                                            into: pcm.mutableAudioBufferList) == noErr else {
+            report("звук: не удалось скопировать данные")
             return
         }
+        if bigEndian { Self.swapBytes(pcm, bitsPerSample: Int(source.mBitsPerChannel)) }
         let millis = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds * 1000
         let time = UInt32(truncatingIfNeeded: Int64(millis))
 
@@ -40,6 +60,31 @@ final class AudioEncoder {
         }
     }
 
+    /// Одно и то же сообщение пишется в журнал один раз.
+    private func report(_ message: String) {
+        queue.async {
+            guard self.reported.insert(message).inserted else { return }
+            self.onLog?(message)
+        }
+    }
+
+    private static func swapBytes(_ buffer: AVAudioPCMBuffer, bitsPerSample: Int) {
+        for audioBuffer in UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList) {
+            guard let data = audioBuffer.mData else { continue }
+            let size = Int(audioBuffer.mDataByteSize)
+            switch bitsPerSample {
+            case 16:
+                let samples = data.bindMemory(to: UInt16.self, capacity: size / 2)
+                for index in 0..<size / 2 { samples[index] = samples[index].byteSwapped }
+            case 32:
+                let samples = data.bindMemory(to: UInt32.self, capacity: size / 4)
+                for index in 0..<size / 4 { samples[index] = samples[index].byteSwapped }
+            default:
+                break
+            }
+        }
+    }
+
     private func makeConverter(for input: AVAudioFormat) {
         converter = nil
         outputFormat = nil
@@ -52,7 +97,10 @@ final class AudioEncoder {
             mBytesPerPacket: 0, mFramesPerPacket: 1024, mBytesPerFrame: 0,
             mChannelsPerFrame: channels, mBitsPerChannel: 0, mReserved: 0)
         guard let output = AVAudioFormat(streamDescription: &description),
-              let converter = AVAudioConverter(from: input, to: output) else { return }
+              let converter = AVAudioConverter(from: input, to: output) else {
+            onLog?("звук: кодировщик AAC не создан")
+            return
+        }
         converter.bitRate = channels == 1 ? 64_000 : 128_000
         converter.downmix = input.channelCount > 2
         self.converter = converter
