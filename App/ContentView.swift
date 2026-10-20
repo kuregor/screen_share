@@ -34,6 +34,9 @@ struct ContentView: View {
                         Text(verbatim: "http://\(address):\(LocalNetwork.port)")
                             .font(.system(.title2, design: .monospaced).bold())
                             .textSelection(.enabled)
+                        Text("Или через Media Station X: Settings → Start Parameter → Setup, введи \(address):\(String(LocalNetwork.port)). Экран телефона откроется сам при запуске MSX.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     } else {
                         Text("Wi-Fi не подключён")
                             .foregroundStyle(.red)

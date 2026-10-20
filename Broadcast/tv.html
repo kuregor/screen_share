@@ -71,6 +71,8 @@
   #fullscreen:focus { outline: 3px solid #4da3ff; outline-offset: 3px; }
   body.idle { cursor: none; }
   body.idle .label, body.idle #bar { opacity: 0; }
+  /* Внутри Media Station X страница — видеоплагин: пульт управляет MSX, кнопка не нужна. */
+  body.embedded #bar { display: none; }
 </style>
 </head>
 <body>
@@ -383,6 +385,14 @@
       request.call(root);
     }
   };
+
+  var embedded;
+  try {
+    embedded = window.self !== window.top;
+  } catch (e) {
+    embedded = true;
+  }
+  if (embedded) document.body.className += ' embedded';
 
   // Телефон, который отдал эту страницу, плюс адреса из #хеша на случай,
   // если роутер не пропускает Bonjour: http://адрес-1:8080/#адрес-2:8080

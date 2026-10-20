@@ -7,7 +7,8 @@ import Network
 /// - `/` — страница для телевизора (tv.html), `/jmuxer.min.js` — библиотека для неё;
 /// - `/stream` — экран потоком MJPEG, запасной вариант для старых браузеров;
 /// - `/status` — JSON с адресами других телефонов, найденных через Bonjour.
-///   По нему страница сама подключает второй телефон.
+///   По нему страница сама подключает второй телефон;
+/// - `/msx/start.json`, `/msx/content.json` — запуск через приложение Media Station X на телевизоре.
 ///
 /// WebSocket на порту `LocalNetwork.videoPort` — экран в H.264. Каждое сообщение:
 /// 1 байт флагов (бит 0 — ключевой кадр), 4 байта времени кадра в мс (big-endian), затем кадр в Annex B.
@@ -175,10 +176,16 @@ final class StreamServer {
             respond(connection, type: "application/javascript", body: jmuxer)
         case "/status":
             let status: [String: Any] = ["host": ownHost, "video": Int(LocalNetwork.videoPort), "peers": peers]
-            let body = (try? JSONSerialization.data(withJSONObject: status)) ?? Data()
-            respond(connection, type: "application/json", body: body)
+            respond(connection, type: "application/json", body: Self.json(status))
         case "/stream":
             startJPEGStream(connection)
+        case "/msx/start.json":
+            // Media Station X: «Стартовый параметр» = адрес телефона. {SERVER} приложение подставит само.
+            let start = ["name": "Экран на ТВ", "version": "1.0.0",
+                         "parameter": "content:http://{SERVER}/msx/content.json"]
+            respond(connection, type: "application/json", body: Self.json(start))
+        case "/msx/content.json":
+            respond(connection, type: "application/json", body: Self.json(msxContent))
         default:
             respond(connection, status: "404 Not Found", type: "text/plain", body: Data("Not found".utf8))
         }
@@ -216,6 +223,23 @@ final class StreamServer {
         jpegViewerCount = jpegViewers.count
         videoViewerCount = videoViewers.count
         lock.unlock()
+    }
+
+    /// Страница MSX: при запуске сразу открывает экран телефона как видеоплагин,
+    /// а после выхода по кнопке «Назад» показывает кнопку, чтобы открыть его снова.
+    private var msxContent: [String: Any] {
+        let plugin = "video:plugin:http://\(ownHost)/?msx"
+        let button: [String: Any] = ["type": "button", "layout": "0,0,6,2", "icon": "cast",
+                                     "label": "Показать экран телефона", "action": plugin]
+        let hint: [String: Any] = ["type": "space", "layout": "0,2,12,2",
+                                   "text": ["Начни вещание на iPhone и нажми кнопку выше.",
+                                            "Второй телефон с этим приложением появится на экране сам."]]
+        return ["headline": "Экран на ТВ", "action": plugin, "type": "pages",
+                "pages": [["items": [button, hint]]]]
+    }
+
+    private static func json(_ object: Any) -> Data {
+        (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
     private static func resource(_ name: String, _ ext: String) -> Data {
