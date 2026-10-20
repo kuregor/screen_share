@@ -11,7 +11,8 @@ import Network
 /// - `/msx/start.json`, `/msx/content.json` — запуск через приложение Media Station X на телевизоре.
 ///
 /// WebSocket на порту `LocalNetwork.videoPort` — экран в H.264. Каждое сообщение:
-/// 1 байт флагов (бит 0 — ключевой кадр), 4 байта времени кадра в мс (big-endian), затем кадр в Annex B.
+/// 1 байт флагов (бит 0 — ключевой кадр, биты 1–2 — сколько четвертей оборота по часовой
+/// повернуть кадр при показе), 4 байта времени кадра в мс (big-endian), затем кадр в Annex B.
 final class StreamServer {
     var onFailure: ((Error) -> Void)?
     /// Новому зрителю H.264 нужен ключевой кадр, без него видео не начнётся.
@@ -109,9 +110,9 @@ final class StreamServer {
         }
     }
 
-    func broadcastVideo(_ frame: Data, isKey: Bool, timestamp: UInt32) {
+    func broadcastVideo(_ frame: Data, isKey: Bool, timestamp: UInt32, quarterTurns: UInt8) {
         queue.async {
-            var packet = Data([isKey ? 1 : 0])
+            var packet = Data([(isKey ? 1 : 0) | (quarterTurns & 3) << 1])
             withUnsafeBytes(of: timestamp.bigEndian) { packet.append(contentsOf: $0) }
             packet.append(frame)
 

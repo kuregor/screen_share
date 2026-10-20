@@ -6,9 +6,9 @@ import VideoToolbox
 /// Такой поток страница телевизора отдаёт jmuxer, а тот — встроенному видеоплееру браузера.
 /// По сравнению с MJPEG это в несколько раз меньше трафика, а декодирует телевизор аппаратно.
 final class H264Encoder {
-    /// Готовый кадр, признак ключевого кадра и время кадра в миллисекундах.
+    /// Готовый кадр, признак ключевого кадра, время кадра в миллисекундах и поворот для показа.
     /// Вызывается из внутренней очереди кодировщика.
-    var onFrame: ((Data, Bool, UInt32) -> Void)?
+    var onFrame: ((Data, Bool, UInt32, UInt8) -> Void)?
 
     private let queue = DispatchQueue(label: "H264Encoder")
     private var session: VTCompressionSession?
@@ -21,14 +21,18 @@ final class H264Encoder {
         if let session { VTCompressionSessionInvalidate(session) }
     }
 
-    func encode(_ buffer: CVPixelBuffer, time: CMTime, forceKeyFrame: Bool = false) {
-        queue.async { self.encodeNow(buffer, time: time, forceKeyFrame: forceKeyFrame) }
+    /// `quarterTurns` — на сколько четвертей оборота по часовой повернуть кадр при показе.
+    /// Кодировщику он не нужен, просто едет вместе с кадром до телевизора.
+    func encode(_ buffer: CVPixelBuffer, time: CMTime, quarterTurns: UInt8, forceKeyFrame: Bool = false) {
+        queue.async {
+            self.encodeNow(buffer, time: time, quarterTurns: quarterTurns, forceKeyFrame: forceKeyFrame)
+        }
     }
 
-    private func encodeNow(_ buffer: CVPixelBuffer, time: CMTime, forceKeyFrame: Bool) {
+    private func encodeNow(_ buffer: CVPixelBuffer, time: CMTime, quarterTurns: UInt8, forceKeyFrame: Bool) {
         let w = CVPixelBufferGetWidth(buffer)
         let h = CVPixelBufferGetHeight(buffer)
-        // Телефон повернули: разрешение сменилось, нужен новый сеанс. Он начнётся с ключевого кадра.
+        // Разрешение сменилось, нужен новый сеанс. Он начнётся с ключевого кадра.
         if session == nil || w != width || h != height {
             makeSession(width: w, height: h)
         }
@@ -46,7 +50,7 @@ final class H264Encoder {
                                         duration: .invalid, frameProperties: properties,
                                         infoFlagsOut: nil) { [weak self] status, _, sample in
             guard status == noErr, let sample, let self else { return }
-            self.queue.async { self.deliver(sample) }
+            self.queue.async { self.deliver(sample, quarterTurns: quarterTurns) }
         }
     }
 
@@ -69,8 +73,8 @@ final class H264Encoder {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_Main_AutoLevel,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
-            kVTCompressionPropertyKey_AverageBitRate: 5_000_000,
-            kVTCompressionPropertyKey_DataRateLimits: [7_500_000 / 8, 1] as CFArray,
+            kVTCompressionPropertyKey_AverageBitRate: 12_000_000,
+            kVTCompressionPropertyKey_DataRateLimits: [18_000_000 / 8, 1] as CFArray,
             kVTCompressionPropertyKey_ExpectedFrameRate: 60,
             kVTCompressionPropertyKey_MaxKeyFrameInterval: 120,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2,
@@ -83,7 +87,7 @@ final class H264Encoder {
         self.height = height
     }
 
-    private func deliver(_ sample: CMSampleBuffer) {
+    private func deliver(_ sample: CMSampleBuffer, quarterTurns: UInt8) {
         guard let block = CMSampleBufferGetDataBuffer(sample) else { return }
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[String: Any]]
         let isKey = !(attachments?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool ?? false)
@@ -125,6 +129,6 @@ final class H264Encoder {
         }
 
         let millis = CMSampleBufferGetPresentationTimeStamp(sample).seconds * 1000
-        onFrame?(output, isKey, UInt32(truncatingIfNeeded: Int64(millis)))
+        onFrame?(output, isKey, UInt32(truncatingIfNeeded: Int64(millis)), quarterTurns)
     }
 }

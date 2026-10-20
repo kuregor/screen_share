@@ -24,8 +24,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         server.onKeyFrameNeeded = { [weak self] in
             DispatchQueue.global(qos: .userInitiated).async { self?.sendKeyFrame() }
         }
-        h264.onFrame = { [weak server] frame, isKey, timestamp in
-            server?.broadcastVideo(frame, isKey: isKey, timestamp: timestamp)
+        h264.onFrame = { [weak server] frame, isKey, timestamp, quarterTurns in
+            server?.broadcastVideo(frame, isKey: isKey, timestamp: timestamp, quarterTurns: quarterTurns)
         }
         do {
             try server.start()
@@ -49,14 +49,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         // Кадры сжимаем, только когда телевизор подключён: так расширение не тратит батарею впустую.
         let now = ProcessInfo.processInfo.systemUptime
-        let wantsVideo = server.hasVideoViewers && videoLimiter.allow(now)
-        let wantsJPEG = server.hasJPEGViewers && jpegLimiter.allow(now)
-        guard wantsVideo || wantsJPEG, let frame = processor.process(sampleBuffer) else { return }
-
-        if wantsVideo {
-            h264.encode(frame, time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        if server.hasVideoViewers, videoLimiter.allow(now), let video = processor.videoFrame(sampleBuffer) {
+            h264.encode(video.buffer, time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+                        quarterTurns: video.quarterTurns)
         }
-        if wantsJPEG, let jpeg = JPEGEncoder.encode(frame) {
+        if server.hasJPEGViewers, jpegLimiter.allow(now), let frame = processor.jpegFrame(sampleBuffer),
+           let jpeg = JPEGEncoder.encode(frame) {
             server.broadcast(jpeg)
         }
     }
@@ -66,8 +64,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func sendKeyFrame() {
         lock.lock()
         defer { lock.unlock() }
-        guard let sample = latestSample, let frame = processor.process(sample) else { return }
-        h264.encode(frame, time: CMSampleBufferGetPresentationTimeStamp(sample), forceKeyFrame: true)
+        guard let sample = latestSample, let video = processor.videoFrame(sample) else { return }
+        h264.encode(video.buffer, time: CMSampleBufferGetPresentationTimeStamp(sample),
+                    quarterTurns: video.quarterTurns, forceKeyFrame: true)
     }
 
     private func finish(_ message: String) {
