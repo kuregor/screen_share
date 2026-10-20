@@ -92,8 +92,11 @@
   var POLL_MS = 2000;
   var MAX_FAILS = 3;
   var HIDE_UI_MS = 4000;
+  var FIRST_HIDE_UI_MS = 15000;
   var VIDEO_START_MS = 8000;
-  var MAX_LAG_S = 0.5;
+  // Задержку убираем плавно, чуть ускоряя видео. Перемотка заметна как рывок, поэтому только при большом отставании.
+  var CATCH_UP_LAG_S = 0.25;
+  var JUMP_LAG_S = 1.5;
 
   // H.264 через Media Source Extensions. Если браузер не умеет, показываем MJPEG.
   var canPlayVideo = !!(window.JMuxer && window.MediaSource &&
@@ -113,7 +116,7 @@
 
   function add(host) {
     if (host && !find(host)) {
-      phones.push({ host: host, fails: 0, tile: null, media: null, mode: '', fps: 0, noVideo: false });
+      phones.push({ host: host, fails: 0, tile: null, media: null, mode: '', fps: 0, noVideo: false, session: 0 });
     }
   }
 
@@ -189,6 +192,7 @@
   function stopMedia(phone) {
     var media = phone.media;
     phone.media = null;
+    phone.session++;
     clearTimeout(phone.startTimer);
     if (phone.ws) {
       var ws = phone.ws;
@@ -226,20 +230,28 @@
 
   // --- H.264 ---
 
-  function startVideo(phone) {
+  function createVideo() {
     var video = document.createElement('video');
     video.muted = true;
     video.autoplay = true;
     video.setAttribute('playsinline', '');
-    setMedia(phone, video, 'H.264');
+    return video;
+  }
+
+  function startVideo(phone) {
+    setMedia(phone, createVideo(), 'H.264');
+    // Номер сеанса: таймеры и сокеты от прошлых сеансов проверяют его и ничего не трогают.
+    var session = phone.session;
     phone.sps = null;
     phone.frames = 0;
-    phone.decoded = decodedFrames(video);
-    openSocket(phone, video);
+    phone.framesBefore = 0;
+    phone.received = 0;
+    phone.decoded = 0;
+    openSocket(phone, session);
 
     // Видео так и не пошло: значит, браузер не справляется с H.264. Переходим на MJPEG.
     phone.startTimer = setTimeout(function () {
-      if (phone.media === video && video.readyState < 2) {
+      if (phone.session === session && phone.media.readyState < 2) {
         phone.noVideo = true;
         stopMedia(phone);
         startJpeg(phone);
@@ -248,7 +260,7 @@
     }, VIDEO_START_MS);
   }
 
-  function openSocket(phone, video) {
+  function openSocket(phone, session) {
     var ws = new WebSocket('ws://' + phone.host.split(':')[0] + ':' + phone.videoPort + '/');
     ws.binaryType = 'arraybuffer';
     phone.ws = ws;
@@ -259,9 +271,25 @@
       if (phone.ws !== ws) return;
       phone.ws = null;
       setTimeout(function () {
-        if (phone.media === video) openSocket(phone, video);
+        if (phone.session === session) openSocket(phone, session);
       }, 1000);
     };
+  }
+
+  // Телефон повернули, и разрешение сменилось. Старый элемент video может сохранить прежние
+  // пропорции и показать новую картинку мелко, с полосами со всех сторон. Поэтому ставим новый элемент.
+  function replaceVideo(phone) {
+    if (phone.muxer) {
+      try { phone.muxer.destroy(); } catch (e) {}
+      phone.muxer = null;
+    }
+    var old = phone.media;
+    var video = createVideo();
+    phone.tile.replaceChild(video, old);
+    old.removeAttribute('src');
+    old.load();
+    phone.media = video;
+    phone.decoded = 0;
   }
 
   // Сообщение: 1 байт флагов (бит 0 — ключевой кадр), 4 байта времени в мс, затем кадр в Annex B.
@@ -272,16 +300,18 @@
     var frame = bytes.subarray(5);
 
     if (isKey) {
-      // Телефон повернули — разрешение и SPS сменились. Плеер нужно пересоздать.
+      // Первый ключевой кадр запускает плеер. Новый SPS значит, что телефон повернули
+      // или плеер сломался: тогда пересоздаём и плеер, и элемент video.
       var sps = findSps(frame);
       if (sps !== null && sps !== phone.sps) {
+        if (phone.sps !== null) replaceVideo(phone);
         resetMuxer(phone);
         phone.sps = sps;
       }
     }
     if (!phone.muxer) return; // ждём ключевой кадр
 
-    var duration = phone.lastTime === null ? 33 : Math.max(1, Math.min(100, time - phone.lastTime));
+    var duration = phone.lastTime === null ? 17 : Math.max(1, Math.min(100, time - phone.lastTime));
     phone.lastTime = time;
     phone.frames++;
     phone.muxer.feed({ video: frame, duration: duration });
@@ -296,12 +326,15 @@
       node: phone.media,
       mode: 'video',
       flushingTime: 0,
+      // Сам jmuxer при отставании больше maxDelay перематывает в самый конец буфера,
+      // после чего видео сразу встаёт без данных. Отставание держит keepLive, а у jmuxer этот порог высокий.
+      maxDelay: 10000,
       clearBuffer: true,
-      fps: 30,
+      fps: 60,
       debug: false,
       onError: function () {
-        // Плеер сломался — пересоздадим его на следующем ключевом кадре.
-        phone.sps = null;
+        // Плеер сломался. Метка не совпадёт ни с одним SPS, и следующий ключевой кадр всё пересоздаст.
+        phone.sps = 'broken';
       }
     });
   }
@@ -327,8 +360,12 @@
     phones.forEach(function (phone) {
       var video = phone.media;
       if (!video || phone.mode !== 'H.264' || !video.buffered.length) return;
-      var end = video.buffered.end(video.buffered.length - 1);
-      if (end - video.currentTime > MAX_LAG_S) video.currentTime = end - 0.05;
+      var lag = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+      if (lag > JUMP_LAG_S) {
+        video.currentTime = video.buffered.end(video.buffered.length - 1) - 0.1;
+      }
+      var rate = lag > CATCH_UP_LAG_S ? 1.1 : 1;
+      if (video.playbackRate !== rate) video.playbackRate = rate;
       if (video.paused) {
         var playing = video.play();
         if (playing && playing.catch) playing.catch(function () {});
@@ -336,12 +373,16 @@
     });
   }
 
+  // Сколько кадров в секунду пришло по сети и сколько показал плеер.
+  // Мало пришло — не успевает телефон или Wi-Fi. Пришло много, а показано мало — не успевает телевизор.
   function measureFps() {
     phones.forEach(function (phone) {
       if (!phone.media || phone.mode !== 'H.264') return;
       var decoded = decodedFrames(phone.media);
       phone.fps = Math.round((decoded - phone.decoded) / 2);
+      phone.received = Math.round((phone.frames - phone.framesBefore) / 2);
       phone.decoded = decoded;
+      phone.framesBefore = phone.frames;
     });
     relabel();
   }
@@ -353,7 +394,9 @@
     phones.forEach(function (phone) {
       if (!phone.tile) return;
       var text = 'Телефон ' + (++count) + ' · ' + phone.mode;
-      if (phone.mode === 'H.264' && phone.fps > 0) text += ' · ' + phone.fps + ' к/с';
+      if (phone.mode === 'H.264' && phone.received > 0) {
+        text += ' · приём ' + phone.received + ' · показ ' + phone.fps + ' к/с';
+      }
       phone.label.textContent = text;
     });
     empty.style.display = count ? 'none' : '';
@@ -364,14 +407,15 @@
   }
 
   // Подпись и кнопка прячутся, если пульт не трогали несколько секунд.
+  // В MSX страница не получает нажатий пульта, поэтому при запуске подпись видна подольше.
   var idleTimer = null;
-  function wake() {
+  function wake(delay) {
     document.body.classList.remove('idle');
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(function () { document.body.classList.add('idle'); }, HIDE_UI_MS);
+    idleTimer = setTimeout(function () { document.body.classList.add('idle'); }, delay || HIDE_UI_MS);
   }
   ['mousemove', 'keydown', 'click', 'touchstart'].forEach(function (type) {
-    document.addEventListener(type, wake);
+    document.addEventListener(type, function () { wake(); });
   });
 
   var fullscreen = document.getElementById('fullscreen');
@@ -402,7 +446,7 @@
   setInterval(tick, POLL_MS);
   setInterval(keepLive, 500);
   setInterval(measureFps, 2000);
-  wake();
+  wake(FIRST_HIDE_UI_MS);
   fullscreen.focus();
 })();
 </script>

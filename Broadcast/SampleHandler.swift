@@ -9,8 +9,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
     // Обработка идёт и из потока ReplayKit, и по запросу ключевого кадра, поэтому под замком.
     private let lock = NSLock()
     private var latestSample: CMSampleBuffer?
-    private var lastVideo: TimeInterval = 0
-    private var lastJPEG: TimeInterval = 0
+    private var videoLimiter = FrameLimiter(fps: 60)
+    private var jpegLimiter = FrameLimiter(fps: 20)
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         guard let address = LocalNetwork.wifiAddress() else {
@@ -49,16 +49,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         // Кадры сжимаем, только когда телевизор подключён: так расширение не тратит батарею впустую.
         let now = ProcessInfo.processInfo.systemUptime
-        let wantsVideo = server.hasVideoViewers && now - lastVideo >= 1.0 / 30
-        let wantsJPEG = server.hasJPEGViewers && now - lastJPEG >= 1.0 / 20
+        let wantsVideo = server.hasVideoViewers && videoLimiter.allow(now)
+        let wantsJPEG = server.hasJPEGViewers && jpegLimiter.allow(now)
         guard wantsVideo || wantsJPEG, let frame = processor.process(sampleBuffer) else { return }
 
         if wantsVideo {
-            lastVideo = now
             h264.encode(frame, time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         }
         if wantsJPEG, let jpeg = JPEGEncoder.encode(frame) {
-            lastJPEG = now
             server.broadcast(jpeg)
         }
     }
@@ -75,5 +73,25 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func finish(_ message: String) {
         finishBroadcastWithError(NSError(domain: "ScreenShare", code: 1,
                                          userInfo: [NSLocalizedDescriptionKey: message]))
+    }
+}
+
+/// Пропускает не больше `fps` кадров в секунду.
+///
+/// Кадры ReplayKit приходят неровно, с дрожанием в пару миллисекунд. Строгая проверка
+/// «прошло не меньше 1/fps» отбрасывает кадр, пришедший чуть раньше срока, и ждёт следующего:
+/// так из 30 кадров в секунду получалось около 20. Поэтому допускаем кадр на четверть интервала раньше.
+struct FrameLimiter {
+    private let interval: TimeInterval
+    private var last: TimeInterval = 0
+
+    init(fps: Double) {
+        interval = 1 / fps
+    }
+
+    mutating func allow(_ now: TimeInterval) -> Bool {
+        guard now - last >= interval * 0.75 else { return false }
+        last = now
+        return true
     }
 }

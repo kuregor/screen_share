@@ -56,14 +56,15 @@ final class FrameProcessor {
         max(16, Int((value / 16).rounded()) * 16)
     }
 
-    /// Ориентация из ReplayKit задана в смысле EXIF: сколько повернуть кадр, чтобы он встал прямо.
+    /// Поворот, после которого кадр встаёт прямо. Направления проверены на iPhone:
+    /// с поворотом по EXIF (.right — по часовой) картинка в альбомной ориентации была вверх ногами.
     private static func rotationAngle(of sampleBuffer: CMSampleBuffer) -> CFString? {
         guard let value = CMGetAttachment(sampleBuffer, key: RPVideoSampleOrientationKey as CFString,
                                           attachmentModeOut: nil) as? NSNumber,
               let orientation = CGImagePropertyOrientation(rawValue: value.uint32Value) else { return nil }
         switch orientation {
-        case .right: return kVTRotation_CW90
-        case .left: return kVTRotation_CCW90
+        case .right: return kVTRotation_CCW90
+        case .left: return kVTRotation_CW90
         case .down: return kVTRotation_180
         default: return nil
         }

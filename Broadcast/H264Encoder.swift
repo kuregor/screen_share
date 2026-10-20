@@ -69,10 +69,10 @@ final class H264Encoder {
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_Main_AutoLevel,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
-            kVTCompressionPropertyKey_AverageBitRate: 4_000_000,
-            kVTCompressionPropertyKey_DataRateLimits: [6_000_000 / 8, 1] as CFArray,
-            kVTCompressionPropertyKey_ExpectedFrameRate: 30,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval: 60,
+            kVTCompressionPropertyKey_AverageBitRate: 5_000_000,
+            kVTCompressionPropertyKey_DataRateLimits: [7_500_000 / 8, 1] as CFArray,
+            kVTCompressionPropertyKey_ExpectedFrameRate: 60,
+            kVTCompressionPropertyKey_MaxKeyFrameInterval: 120,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2,
         ]
         VTSessionSetProperties(created, propertyDictionary: properties as CFDictionary)

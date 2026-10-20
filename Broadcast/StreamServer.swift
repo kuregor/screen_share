@@ -124,7 +124,8 @@ final class StreamServer {
                 }
                 viewer.queue.append(packet)
                 // Wi-Fi не успевает: выбрасываем очередь, чтобы не копить задержку, и просим ключевой кадр.
-                if viewer.queue.count > 15 {
+                // 30 кадров — около полсекунды при 60 к/с.
+                if viewer.queue.count > 30 {
                     viewer.queue.removeAll()
                     viewer.waitingForKey = true
                     needsKeyFrame = true
