@@ -6,21 +6,28 @@ import VideoToolbox
 
 /// Готовит кадры экрана для телевизора.
 ///
-/// Для H.264 кадр только уменьшается до 1920 px по длинной стороне и остаётся в YUV (NV12):
-/// это вдвое компактнее BGRA, а расширению трансляции iOS даёт всего около 50 МБ памяти.
-/// Поворот для H.264 не делается: страница телевизора поворачивает видео сама, а поток
-/// не меняет разрешение при повороте телефона.
+/// Для H.264 кадр всегда горизонтальный, до 1920 px по ширине: декодеры телевизоров LG
+/// рассчитаны на 1920×1080 и вертикальное видео 880×1920 не показывают. Портретный экран
+/// телефона поворачивается на четверть оборота, а страница телевизора поворачивает его обратно
+/// по флагу. Кадр остаётся в YUV (NV12): это вдвое компактнее BGRA, а расширению трансляции
+/// iOS даёт всего около 50 МБ памяти. Если поворот в NV12 не поддерживается, используется
+/// BGRA с меньшим разрешением.
 ///
 /// Для запасного MJPEG кадр уменьшается до 1280 px и поворачивается здесь, в BGRA.
 ///
 /// Буферы берутся из пулов, а не переиспользуются: кодировщик H.264 держит кадр, пока сжимает его.
 final class FrameProcessor {
     private let videoMaxSide = 1920
+    private let fallbackVideoMaxSide = 1280
     private let jpegMaxSide = 1280
 
     private var transfer: VTPixelTransferSession?
     private var rotation: VTPixelRotationSession?
+    private var nv12RotationWorks = true
     private var videoPool = BufferPool(format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    private var videoRotatedPool = BufferPool(format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    private var fallbackVideoPool = BufferPool(format: kCVPixelFormatType_32BGRA)
+    private var fallbackRotatedPool = BufferPool(format: kCVPixelFormatType_32BGRA)
     private var jpegPool = BufferPool(format: kCVPixelFormatType_32BGRA)
     private var rotatedPool = BufferPool(format: kCVPixelFormatType_32BGRA)
 
@@ -34,25 +41,45 @@ final class FrameProcessor {
         if let rotation { VTPixelRotationSessionInvalidate(rotation) }
     }
 
-    /// Кадр для H.264 и число четвертей оборота по часовой, на которое его нужно повернуть при показе.
+    /// Горизонтальный кадр для H.264 и число четвертей оборота по часовой,
+    /// на которое его нужно повернуть при показе.
     func videoFrame(_ sampleBuffer: CMSampleBuffer) -> (buffer: CVPixelBuffer, quarterTurns: UInt8)? {
-        guard let frame = scaled(sampleBuffer, maxSide: videoMaxSide, pool: &videoPool) else { return nil }
-        return (frame, Self.quarterTurns(of: sampleBuffer))
+        let needed = Self.quarterTurns(of: sampleBuffer)
+        if nv12RotationWorks, let frame = scaled(sampleBuffer, maxSide: videoMaxSide, pool: &videoPool) {
+            if let landscape = makeLandscape(frame, needed: needed, pool: &videoRotatedPool) {
+                return landscape
+            }
+            nv12RotationWorks = false
+        }
+        guard let frame = scaled(sampleBuffer, maxSide: fallbackVideoMaxSide, pool: &fallbackVideoPool) else {
+            return nil
+        }
+        return makeLandscape(frame, needed: needed, pool: &fallbackRotatedPool)
     }
 
     /// Кадр для MJPEG, уже повёрнутый как надо.
     func jpegFrame(_ sampleBuffer: CMSampleBuffer) -> CVPixelBuffer? {
-        guard let rotation, let frame = scaled(sampleBuffer, maxSide: jpegMaxSide, pool: &jpegPool) else {
-            return nil
-        }
+        guard let frame = scaled(sampleBuffer, maxSide: jpegMaxSide, pool: &jpegPool) else { return nil }
         let turns = Self.quarterTurns(of: sampleBuffer)
-        guard turns != 0 else { return frame }
+        return turns == 0 ? frame : rotate(frame, turns: turns, pool: &rotatedPool)
+    }
 
-        let angle = [kVTRotation_0, kVTRotation_CW90, kVTRotation_180, kVTRotation_CCW90][Int(turns)]
+    /// Портретный кадр кладём набок поворотом по часовой. Тогда для показа его нужно повернуть
+    /// на четверть оборота меньше, чем требовала ориентация телефона.
+    private func makeLandscape(_ frame: CVPixelBuffer, needed: UInt8,
+                               pool: inout BufferPool) -> (buffer: CVPixelBuffer, quarterTurns: UInt8)? {
+        guard CVPixelBufferGetHeight(frame) > CVPixelBufferGetWidth(frame) else { return (frame, needed) }
+        guard let rotated = rotate(frame, turns: 1, pool: &pool) else { return nil }
+        return (rotated, (needed + 3) % 4)
+    }
+
+    private func rotate(_ frame: CVPixelBuffer, turns: UInt8, pool: inout BufferPool) -> CVPixelBuffer? {
+        guard let rotation else { return nil }
+        let angle = [kVTRotation_0, kVTRotation_CW90, kVTRotation_180, kVTRotation_CCW90][Int(turns % 4)]
         let w = CVPixelBufferGetWidth(frame)
         let h = CVPixelBufferGetHeight(frame)
         let sideways = turns % 2 == 1
-        guard let rotated = rotatedPool.buffer(width: sideways ? h : w, height: sideways ? w : h),
+        guard let rotated = pool.buffer(width: sideways ? h : w, height: sideways ? w : h),
               VTSessionSetProperty(rotation, key: kVTPixelRotationPropertyKey_Rotation, value: angle) == noErr,
               VTPixelRotationSessionRotateImage(rotation, frame, rotated) == noErr else {
             return nil

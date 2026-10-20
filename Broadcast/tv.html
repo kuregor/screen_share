@@ -102,6 +102,27 @@
   var canPlayVideo = !!(window.JMuxer && window.MediaSource &&
     MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'));
 
+  // Журнал диагностики уходит на телефон, его можно прочитать с компьютера: http://адрес-телефона:8080/log
+  function report(phone, text) {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', 'http://' + phone.host + '/log?m=' + encodeURIComponent(text));
+      xhr.send();
+    } catch (e) {}
+  }
+
+  function environment() {
+    var codecs = ['avc1.42E01E', 'avc1.4D401F', 'avc1.4D4028', 'avc1.4D402A', 'avc1.640028'];
+    var support = codecs.map(function (codec) {
+      var ok = window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="' + codec + '"');
+      return codec + '=' + (ok ? 'да' : 'нет');
+    });
+    return 'старт: ' + navigator.userAgent + ' | экран ' + screen.width + 'x' + screen.height +
+      ' | окно ' + window.innerWidth + 'x' + window.innerHeight + ' | в iframe: ' + embedded +
+      ' | MediaSource: ' + !!window.MediaSource + ' | WebSocket: ' + !!window.WebSocket +
+      ' | ' + support.join(' ');
+  }
+
   // Телефоны в порядке обнаружения: первый показывается слева.
   var phones = [];
   var screens = document.getElementById('screens');
@@ -160,6 +181,7 @@
     if (canPlayVideo && phone.videoPort && !phone.noVideo) {
       startVideo(phone);
     } else {
+      if (!canPlayVideo) phone.reason = 'браузер без MSE';
       startJpeg(phone);
     }
 
@@ -230,16 +252,23 @@
 
   // --- H.264 ---
 
-  function createVideo() {
+  function createVideo(phone) {
     var video = document.createElement('video');
     video.muted = true;
     video.autoplay = true;
     video.setAttribute('playsinline', '');
+    video.addEventListener('loadedmetadata', function () {
+      report(phone, 'видео ' + video.videoWidth + 'x' + video.videoHeight);
+    });
+    video.addEventListener('error', function () {
+      var error = video.error;
+      report(phone, 'ошибка video: код ' + (error && error.code) + ' ' + (error && error.message || ''));
+    });
     return video;
   }
 
   function startVideo(phone) {
-    setMedia(phone, createVideo(), 'H.264');
+    setMedia(phone, createVideo(phone), 'H.264');
     // Номер сеанса: таймеры и сокеты от прошлых сеансов проверяют его и ничего не трогают.
     var session = phone.session;
     phone.turns = 0;
@@ -251,8 +280,19 @@
     openSocket(phone, session);
 
     // Видео так и не пошло: значит, браузер не справляется с H.264. Переходим на MJPEG.
-    phone.startTimer = setTimeout(function () {
-      if (phone.session === session && phone.media.readyState < 2) {
+    // Пока страница скрыта, браузер не загружает видео, поэтому скрытое время не считаем.
+    phone.startTimer = setTimeout(function check() {
+      var video = phone.media;
+      if (phone.session !== session) return;
+      if (document.hidden || document.webkitHidden) {
+        phone.startTimer = setTimeout(check, VIDEO_START_MS);
+        return;
+      }
+      if (video.readyState < 2) {
+        phone.reason = phone.frames ? 'не декодируется' : 'нет кадров';
+        report(phone, 'переход на MJPEG: ' + phone.reason + ', кадров ' + phone.frames +
+          ', readyState ' + video.readyState + ', видео ' + video.videoWidth + 'x' + video.videoHeight +
+          ', ошибка ' + (video.error && video.error.code));
         phone.noVideo = true;
         stopMedia(phone);
         startJpeg(phone);
@@ -265,11 +305,13 @@
     var ws = new WebSocket('ws://' + phone.host.split(':')[0] + ':' + phone.videoPort + '/');
     ws.binaryType = 'arraybuffer';
     phone.ws = ws;
+    ws.onopen = function () { report(phone, 'сокет открыт'); };
     ws.onmessage = function (event) {
       if (phone.ws === ws) feed(phone, event.data);
     };
-    ws.onclose = function () {
+    ws.onclose = function (event) {
       if (phone.ws !== ws) return;
+      report(phone, 'сокет закрыт: код ' + event.code);
       phone.ws = null;
       setTimeout(function () {
         if (phone.session === session) openSocket(phone, session);
@@ -285,7 +327,7 @@
       phone.muxer = null;
     }
     var old = phone.media;
-    var video = createVideo();
+    var video = createVideo(phone);
     phone.tile.replaceChild(video, old);
     old.removeAttribute('src');
     old.load();
@@ -324,8 +366,8 @@
     var time = new DataView(buffer).getUint32(1);
     var frame = bytes.subarray(5);
 
-    // Телефон шлёт кадр всегда в портретном виде, а поворачиваем его мы. Так поток не меняет
-    // разрешение при повороте телефона, и плеер не нужно пересоздавать.
+    // Телефон шлёт кадр всегда горизонтальным (так его понимает декодер телевизора),
+    // а повернуть его как надо — наша задача. Поток не меняет разрешение при повороте телефона.
     if (turns !== phone.turns) {
       phone.turns = turns;
       layoutVideo(phone);
@@ -336,6 +378,8 @@
       // или плеер сломался: тогда пересоздаём и плеер, и элемент video.
       var sps = findSps(frame);
       if (sps !== null && sps !== phone.sps) {
+        report(phone, 'новый SPS, кодек avc1.' + hex(frame[5]) + hex(frame[6]) + hex(frame[7]) +
+          ', поворот ' + turns);
         if (phone.sps !== null) replaceVideo(phone);
         resetMuxer(phone);
         phone.sps = sps;
@@ -357,18 +401,35 @@
     phone.muxer = new JMuxer({
       node: phone.media,
       mode: 'video',
-      flushingTime: 0,
-      // Сам jmuxer при отставании больше maxDelay перематывает в самый конец буфера,
-      // после чего видео сразу встаёт без данных. Отставание держит keepLive, а у jmuxer этот порог высокий.
-      maxDelay: 10000,
+      // Кадры отдаются плееру пачками раз в 60 мс, а не по одному: 60 добавлений в секунду
+      // перегружают слабый процессор телевизора. При flushingTime больше нуля jmuxer
+      // ещё и не перематывает видео сам, отставание держит keepLive.
+      flushingTime: 60,
       clearBuffer: true,
       fps: 60,
       debug: false,
-      onError: function () {
+      onError: function (error) {
+        report(phone, 'ошибка jmuxer: ' + describe(error));
         // Плеер сломался. Метка не совпадёт ни с одним SPS, и следующий ключевой кадр всё пересоздаст.
         phone.sps = 'broken';
+      },
+      onUnsupportedCodec: function (codec) {
+        report(phone, 'кодек не поддерживается: ' + describe(codec));
       }
     });
+  }
+
+  function hex(byte) {
+    return (byte < 16 ? '0' : '') + byte.toString(16).toUpperCase();
+  }
+
+  function describe(value) {
+    if (value && value.message) return value.message;
+    try {
+      return JSON.stringify(value);
+    } catch (e) {
+      return String(value);
+    }
   }
 
   // SPS (NAL типа 7) телефон ставит первым в ключевом кадре. Возвращает его байты строкой.
@@ -418,6 +479,15 @@
       phone.received = Math.round((phone.frames - phone.framesBefore) / 2);
       phone.decoded = decoded;
       phone.framesBefore = phone.frames;
+      // Раз в 10 секунд — сводка в журнал.
+      phone.reports = (phone.reports || 0) + 1;
+      if (phone.reports % 5 === 0) {
+        var video = phone.media;
+        var lag = video.buffered.length ? video.buffered.end(video.buffered.length - 1) - video.currentTime : -1;
+        report(phone, 'приём ' + phone.received + ' показ ' + phone.fps + ' к/с, отставание ' +
+          lag.toFixed(2) + ' с, скорость ' + video.playbackRate + ', readyState ' + video.readyState +
+          ', видео ' + video.videoWidth + 'x' + video.videoHeight + ', поворот ' + phone.turns);
+      }
     });
     relabel();
   }
@@ -432,6 +502,7 @@
       if (phone.mode === 'H.264' && phone.received > 0) {
         text += ' · приём ' + phone.received + ' · показ ' + phone.fps + ' к/с';
       }
+      if (phone.mode === 'MJPEG' && phone.reason) text += ' (H.264: ' + phone.reason + ')';
       phone.label.textContent = text;
     });
     empty.style.display = count ? 'none' : '';
@@ -472,6 +543,7 @@
     embedded = true;
   }
   if (embedded) document.body.className += ' embedded';
+  if (location.host) report({ host: location.host }, environment());
 
   // Телефон, который отдал эту страницу, плюс адреса из #хеша на случай,
   // если роутер не пропускает Bonjour: http://адрес-1:8080/#адрес-2:8080

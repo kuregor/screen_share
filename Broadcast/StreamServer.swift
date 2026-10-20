@@ -8,7 +8,8 @@ import Network
 /// - `/stream` — экран потоком MJPEG, запасной вариант для старых браузеров;
 /// - `/status` — JSON с адресами других телефонов, найденных через Bonjour.
 ///   По нему страница сама подключает второй телефон;
-/// - `/msx/start.json`, `/msx/content.json` — запуск через приложение Media Station X на телевизоре.
+/// - `/msx/start.json`, `/msx/content.json` — запуск через приложение Media Station X на телевизоре;
+/// - `/log` — журнал диагностики, который пишет страница телевизора.
 ///
 /// WebSocket на порту `LocalNetwork.videoPort` — экран в H.264. Каждое сообщение:
 /// 1 байт флагов (бит 0 — ключевой кадр, биты 1–2 — сколько четвертей оборота по часовой
@@ -27,6 +28,8 @@ final class StreamServer {
     private var videoViewers: [VideoViewer] = []
     private var peers: [String] = []
     private var lastJPEG: Data?
+    private var log: [String] = []
+    private let logStart = Date()
 
     private let lock = NSLock()
     private var jpegViewerCount = 0
@@ -169,9 +172,20 @@ final class StreamServer {
     private func route(_ head: String, _ connection: NWConnection) {
         // Первая строка запроса: "GET /stream?t=123 HTTP/1.1".
         let target = head.split(separator: " ", maxSplits: 2).dropFirst().first ?? ""
-        let path = target.split(separator: "?", omittingEmptySubsequences: false).first ?? ""
+        let parts = target.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        let path = parts.first ?? ""
+        let query = parts.count > 1 ? String(parts[1]) : ""
 
         switch path {
+        case "/log":
+            // Журнал диагностики: страница телевизора пишет сюда, что у неё происходит,
+            // а с компьютера в той же сети его можно прочитать: http://адрес-телефона:8080/log
+            if query.hasPrefix("m="), let message = String(query.dropFirst(2)).removingPercentEncoding {
+                appendLog(message)
+                respond(connection, type: "text/plain", body: Data("ok".utf8))
+            } else {
+                respond(connection, type: "text/plain; charset=utf-8", body: Data(log.joined(separator: "\n").utf8))
+            }
         case "/":
             respond(connection, type: "text/html; charset=utf-8", body: page)
         case "/jmuxer.min.js":
@@ -218,6 +232,11 @@ final class StreamServer {
             }
             return host
         }.sorted()
+    }
+
+    private func appendLog(_ message: String) {
+        log.append(String(format: "%7.1f ", Date().timeIntervalSince(logStart)) + message)
+        if log.count > 300 { log.removeFirst(log.count - 300) }
     }
 
     private func updateViewerCounts() {
