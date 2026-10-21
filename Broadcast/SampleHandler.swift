@@ -4,7 +4,6 @@ import ReplayKit
 final class SampleHandler: RPBroadcastSampleHandler {
     private let processor = FrameProcessor()
     private let h264 = H264Encoder()
-    private let audio = AudioEncoder()
 
     // Ссылку на сервер читают поток ReplayKit и сеть, а меняют старт и остановка вещания.
     private let serverLock = NSLock()
@@ -52,10 +51,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
             server?.broadcastVideo(frame, isKey: isKey, timestamp: timestamp, quarterTurns: quarterTurns)
         }
         h264.setBitrate(quality.bitrate)
-        audio.onPacket = { [weak server] packet, timestamp in
-            server?.broadcastAudio(packet, timestamp: timestamp)
-        }
-        audio.onLog = { [weak server] message in server?.log(message) }
         do {
             try server.start()
         } catch {
@@ -72,15 +67,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
-        guard let server else { return }
-        switch sampleBufferType {
-        case .video:
-            processVideo(sampleBuffer, server: server)
-        case .audioApp:
-            if server.hasAudioViewers { audio.encode(sampleBuffer) }
-        default:
-            break
-        }
+        // Звук не передаётся: буферы ReplayKit со звуком просто пропускаем.
+        guard sampleBufferType == .video, let server else { return }
+        processVideo(sampleBuffer, server: server)
     }
 
     private func processVideo(_ sampleBuffer: CMSampleBuffer, server: StreamServer) {

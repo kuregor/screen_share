@@ -15,12 +15,9 @@ import Network
 /// 1 байт флагов (бит 0 — ключевой кадр, биты 1–2 — сколько четвертей оборота по часовой
 /// повернуть кадр при показе), 4 байта времени кадра в мс (big-endian), затем кадр в Annex B.
 /// Страница шлёт обратно текстом свои цифры: {"fps": показано, "rx": принято, "lag": отставание}.
+/// Звук не передаётся.
 ///
-/// WebSocket на порту `LocalNetwork.audioPort` — звук: 1 байт флагов (0x80), 4 байта времени,
-/// затем кадр AAC с заголовком ADTS. Отдельное соединение нужно, чтобы тяжёлый ключевой кадр
-/// видео не задерживал звук.
-///
-/// Защита. Сокеты принимают только подпротокол `t-<токен>`. Токен отдаёт `/status`, а прочитать
+/// Защита. Сокет принимает только подпротокол `t-<токен>`. Токен отдаёт `/status`, а прочитать
 /// ответ `/status` из браузера можно только со страницы, загруженной с телефона в локальной сети
 /// (CORS). Так чужой сайт, открытый на любом устройстве в этой же сети, не утащит экран телефона.
 final class StreamServer {
@@ -45,7 +42,6 @@ final class StreamServer {
     private var browser: NWBrowser?
     private var jpegViewers: [JPEGViewer] = []
     private var videoViewers: [SocketViewer] = []
-    private var audioViewers: [SocketViewer] = []
     private var peers: [String] = []
     private var lastJPEG: Data?
     private var logLines: [String] = []
@@ -54,7 +50,6 @@ final class StreamServer {
     private let lock = NSLock()
     private var jpegViewerCount = 0
     private var videoViewerCount = 0
-    private var audioViewerCount = 0
 
     private lazy var page = Self.resource("tv", "html")
     private lazy var jmuxer = Self.resource("jmuxer.min", "js")
@@ -62,7 +57,6 @@ final class StreamServer {
     // Читаются из потока ReplayKit, поэтому под замком.
     var hasJPEGViewers: Bool { counted { jpegViewerCount > 0 } }
     var hasVideoViewers: Bool { counted { videoViewerCount > 0 } }
-    var hasAudioViewers: Bool { counted { audioViewerCount > 0 } }
 
     init(address: String) {
         ownHost = "\(address):\(LocalNetwork.port)"
@@ -81,13 +75,10 @@ final class StreamServer {
         }
 
         let videoListener = try makeSocketListener(port: LocalNetwork.videoPort) { [weak self] connection in
-            self?.acceptSocket(connection, isVideo: true)
-        }
-        let audioListener = try makeSocketListener(port: LocalNetwork.audioPort) { [weak self] connection in
-            self?.acceptSocket(connection, isVideo: false)
+            self?.acceptSocket(connection)
         }
 
-        listeners = [listener, videoListener, audioListener]
+        listeners = [listener, videoListener]
         for item in listeners {
             item.stateUpdateHandler = { [weak self] state in
                 if case .failed(let error) = state { self?.onFailure?(error) }
@@ -108,10 +99,9 @@ final class StreamServer {
             self.listeners.forEach { $0.cancel() }
             self.browser?.cancel()
             self.jpegViewers.forEach { $0.connection.cancel() }
-            (self.videoViewers + self.audioViewers).forEach { $0.connection.cancel() }
+            self.videoViewers.forEach { $0.connection.cancel() }
             self.jpegViewers.removeAll()
             self.videoViewers.removeAll()
-            self.audioViewers.removeAll()
             self.updateViewerCounts()
         }
     }
@@ -152,18 +142,6 @@ final class StreamServer {
             if congested {
                 self.onCongestion?()
                 self.onKeyFrameNeeded?()
-            }
-        }
-    }
-
-    func broadcastAudio(_ frame: Data, timestamp: UInt32) {
-        let packet = Self.packet(frame, flags: 0x80, timestamp: timestamp)
-        queue.async {
-            for viewer in self.audioViewers {
-                viewer.queue.append(packet)
-                // Около секунды звука. Если не успевает уйти, старое выбрасываем: лучше пропуск, чем задержка.
-                if viewer.queue.count > 50 { viewer.queue.removeFirst(viewer.queue.count - 50) }
-                self.pump(viewer)
             }
         }
     }
@@ -236,7 +214,7 @@ final class StreamServer {
             respond(connection, type: "application/javascript", body: jmuxer)
         case "/status":
             let status: [String: Any] = ["host": ownHost, "video": Int(LocalNetwork.videoPort),
-                                         "audio": Int(LocalNetwork.audioPort), "token": token, "peers": peers]
+                                         "token": token, "peers": peers]
             // В ответе токен, поэтому читать его разрешаем только страницам с телефонов в локальной сети.
             respond(connection, type: "application/json", body: Self.json(status),
                     allowOrigin: origin.flatMap { Self.isLocalPage($0) ? $0 : nil })
@@ -287,7 +265,6 @@ final class StreamServer {
     private func drop(_ connection: NWConnection) {
         jpegViewers.removeAll { $0.connection === connection }
         videoViewers.removeAll { $0.connection === connection }
-        audioViewers.removeAll { $0.connection === connection }
         updateViewerCounts()
     }
 
@@ -309,7 +286,6 @@ final class StreamServer {
         lock.lock()
         jpegViewerCount = jpegViewers.count
         videoViewerCount = videoViewers.count
-        audioViewerCount = audioViewers.count
         lock.unlock()
     }
 
@@ -385,7 +361,7 @@ final class StreamServer {
         })
     }
 
-    // MARK: - Сокеты видео и звука
+    // MARK: - Сокет видео
 
     private final class SocketViewer {
         let connection: NWConnection
@@ -416,20 +392,15 @@ final class StreamServer {
         return listener
     }
 
-    private func acceptSocket(_ connection: NWConnection, isVideo: Bool) {
+    private func acceptSocket(_ connection: NWConnection) {
         let viewer = SocketViewer(connection: connection)
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .ready:
-                if isVideo {
-                    self.videoViewers.append(viewer)
-                    self.updateViewerCounts()
-                    self.onKeyFrameNeeded?()
-                } else {
-                    self.audioViewers.append(viewer)
-                    self.updateViewerCounts()
-                }
+                self.videoViewers.append(viewer)
+                self.updateViewerCounts()
+                self.onKeyFrameNeeded?()
             case .failed, .cancelled:
                 self.drop(connection)
             default:
@@ -440,8 +411,8 @@ final class StreamServer {
         receiveMessages(connection)
     }
 
-    /// Читаем входящие: так обрабатываются ping и закрытие сокета, а по сокету видео
-    /// страница присылает свои цифры (сколько кадров принято и показано).
+    /// Читаем входящие: так обрабатываются ping и закрытие сокета, а ещё страница
+    /// присылает свои цифры (сколько кадров принято и показано).
     private func receiveMessages(_ connection: NWConnection) {
         connection.receiveMessage { [weak self] data, context, _, error in
             let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition)

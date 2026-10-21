@@ -98,14 +98,13 @@
   var CATCH_UP_LAG_S = 0.25;
   var JUMP_LAG_S = 1.5;
 
-  // H.264 и звук играют через Media Source Extensions и jmuxer. Самому jmuxer нужны функции
+  // H.264 играет через Media Source Extensions и jmuxer. Самому jmuxer нужны функции
   // ES2015 (Array.from, Object.assign, Reflect, Symbol): на webOS 3.x их нет, и он падает при создании.
   var hasEs2015 = typeof Array.from === 'function' && typeof Object.assign === 'function' &&
     typeof Reflect === 'object' && typeof Symbol === 'function' &&
     typeof Array.prototype.includes === 'function';
-  var canUseMse = !!(window.JMuxer && window.MediaSource && hasEs2015);
-  var canPlayVideo = canUseMse && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
-  var canPlayAudio = canUseMse && MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"');
+  var canPlayVideo = !!(window.JMuxer && window.MediaSource && hasEs2015) &&
+    MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
   var RETRY_VIDEO_MS = 30000;
 
   // Журнал диагностики уходит на телефон, его можно прочитать с компьютера: http://адрес-телефона:8080/log
@@ -126,7 +125,7 @@
     return 'старт: ' + navigator.userAgent + ' | экран ' + screen.width + 'x' + screen.height +
       ' | окно ' + window.innerWidth + 'x' + window.innerHeight + ' | в iframe: ' + embedded +
       ' | MediaSource: ' + !!window.MediaSource + ' | ES2015: ' + hasEs2015 + ' | WebSocket: ' + !!window.WebSocket +
-      ' | AAC: ' + canPlayAudio + ' | ' + support.join(' ');
+      ' | ' + support.join(' ');
   }
 
   // Телефоны в порядке обнаружения: первый показывается слева.
@@ -162,8 +161,7 @@
       }
       phone.fails = 0;
       phone.videoPort = status.video;
-      phone.audioPort = status.audio;
-      // Токен для сокетов: без него телефон не отдаёт видео и звук.
+      // Токен для сокета: без него телефон не отдаёт видео.
       phone.token = status.token;
       show(phone);
       (status.peers || []).forEach(add);
@@ -193,7 +191,6 @@
       if (!canPlayVideo) phone.reason = hasEs2015 ? 'браузер без MSE' : 'старый браузер';
       startJpeg(phone);
     }
-    if (canPlayAudio && phone.audioPort) startAudio(phone);
 
     var next = null;
     for (var i = phones.indexOf(phone) + 1; i < phones.length; i++) {
@@ -209,7 +206,6 @@
   function hide(phone) {
     if (!phone.tile) return;
     stopMedia(phone);
-    stopAudio(phone);
     screens.removeChild(phone.tile);
     phone.tile = null;
     // Телефон ушёл. Когда вернётся, снова пробуем H.264, а не остаёмся на MJPEG навсегда.
@@ -497,94 +493,6 @@
     try { player.muxer.destroy(); } catch (e) {}
   }
 
-  // --- Звук ---
-  // Звук идёт отдельным сокетом и играет отдельным элементом со своим плеером, независимо от видео:
-  // тяжёлый ключевой кадр не задерживает звук, неподвижный экран его не останавливает,
-  // а при переходе на MJPEG звук остаётся.
-
-  function startAudio(phone) {
-    var audio = document.createElement('audio');
-    audio.autoplay = true;
-    phone.tile.appendChild(audio);
-    phone.audio = audio;
-    phone.audioSession = (phone.audioSession || 0) + 1;
-    openAudioSocket(phone, phone.audioSession);
-  }
-
-  function stopAudio(phone) {
-    phone.audioSession = (phone.audioSession || 0) + 1;
-    if (phone.audioWs) {
-      var ws = phone.audioWs;
-      phone.audioWs = null;
-      ws.close();
-    }
-    resetAudio(phone);
-    if (phone.audio) {
-      phone.audio.removeAttribute('src');
-      phone.audio.load();
-      phone.audio.parentNode.removeChild(phone.audio);
-      phone.audio = null;
-    }
-  }
-
-  function openAudioSocket(phone, session) {
-    var ws = connectSocket(phone, phone.audioPort);
-    phone.audioWs = ws;
-    ws.onmessage = function (event) {
-      if (phone.audioWs === ws) feedAudio(phone, new Uint8Array(event.data).subarray(5));
-    };
-    ws.onclose = function () {
-      if (phone.audioWs !== ws) return;
-      phone.audioWs = null;
-      setTimeout(function () {
-        if (phone.audioSession === session) openAudioSocket(phone, session);
-      }, 1000);
-    };
-  }
-
-  // Кадр AAC с заголовком ADTS, 1024 сэмпла. Частота записана в заголовке.
-  var AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000];
-
-  function feedAudio(phone, packet) {
-    if (!phone.audio || packet.length < 7) return;
-    var rate = AAC_RATES[(packet[2] >> 2) & 0x0f] || 44100;
-    if (!phone.audioMuxer) {
-      report(phone, 'звук: ' + rate + ' Гц, каналов ' + (((packet[2] & 1) << 2) | (packet[3] >> 6)));
-      phone.audioMuxer = createPlayer(phone, phone.audio, 'audio', {
-        onError: function (error) {
-          report(phone, 'ошибка звука: ' + describe(error));
-          resetAudio(phone);
-        }
-      });
-      if (!phone.audioMuxer) return;
-    }
-    feedPlayer(phone.audioMuxer, { audio: packet, duration: 1024000 / rate });
-  }
-
-  function resetAudio(phone) {
-    destroyPlayer(phone.audioMuxer);
-    phone.audioMuxer = null;
-  }
-
-  // Браузер может запретить звук без нажатия кнопки. Тогда просим нажать OK на пульте.
-  function playAudio(phone) {
-    var playing = phone.audio.play();
-    if (playing && playing.then) {
-      playing.then(function () {
-        if (phone.audioBlocked) {
-          phone.audioBlocked = false;
-          relabel();
-        }
-      }, function (error) {
-        if (error && error.name === 'NotAllowedError' && !phone.audioBlocked) {
-          phone.audioBlocked = true;
-          report(phone, 'звук заблокирован браузером до нажатия кнопки');
-          relabel();
-        }
-      });
-    }
-  }
-
   function hex(byte) {
     return (byte < 16 ? '0' : '') + byte.toString(16).toUpperCase();
   }
@@ -614,10 +522,9 @@
     return video.webkitDecodedFrameCount || 0;
   }
 
-  // Плеер браузера копит буфер, и задержка растёт. Держим видео и звук у живого края.
+  // Плеер браузера копит буфер, и задержка растёт. Держим видео у живого края.
   function keepLive() {
     phones.forEach(function (phone) {
-      if (phone.audio && catchUp(phone.audio) && phone.audio.paused && !phone.audioBlocked) playAudio(phone);
       var video = phone.media;
       if (!video || phone.mode !== 'H.264') return;
       // Размер плитки меняется, когда подключается или уходит второй телефон.
@@ -678,7 +585,6 @@
         text += ' · приём ' + phone.received + ' · показ ' + phone.fps + ' к/с';
       }
       if (phone.mode === 'MJPEG' && phone.reason) text += ' (H.264: ' + phone.reason + ')';
-      if (phone.audioBlocked) text += ' · звук: нажми OK на пульте';
       phone.label.textContent = text;
     });
     empty.style.display = count ? 'none' : '';
@@ -698,17 +604,6 @@
   }
   ['mousemove', 'keydown', 'click', 'touchstart'].forEach(function (type) {
     document.addEventListener(type, function () { wake(); });
-  });
-  // Нажатие кнопки разрешает браузеру звук, если он был заблокирован.
-  ['keydown', 'click', 'touchstart'].forEach(function (type) {
-    document.addEventListener(type, function () {
-      phones.forEach(function (phone) {
-        if (phone.audio && phone.audioBlocked) {
-          phone.audioBlocked = false;
-          playAudio(phone);
-        }
-      });
-    });
   });
 
   var fullscreen = document.getElementById('fullscreen');
